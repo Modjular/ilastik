@@ -238,7 +238,7 @@ export class WebGpuBackend {
         return res;
     }
 
-    async gatherFeaturesForTraining(indicesArray) {
+    async gatherFeaturesForTraining(indicesArray, featureBuffer = this.featureBuffer) {
         const numLabels = indicesArray.length;
         const indicesBuffer = this.device.createBuffer({
             size: indicesArray.byteLength,
@@ -266,7 +266,7 @@ export class WebGpuBackend {
         const bindGroup = this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: this.featureBuffer } },
+                { binding: 0, resource: { buffer: featureBuffer } },
                 { binding: 1, resource: { buffer: indicesBuffer } },
                 { binding: 2, resource: { buffer: gatherDstBuffer } }
             ]

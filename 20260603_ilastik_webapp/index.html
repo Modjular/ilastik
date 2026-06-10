@@ -504,6 +504,7 @@ const PhasePanel = {
                     outputDirHandle: appState.outputDirHandle,
                     verifyPermission,
                     writeFile,
+                    resourceMap,
                 });
                 alert('All images exported successfully!');
             } catch (err) {
@@ -833,7 +834,15 @@ async function addImage(file) {
         paint(e, imgMeta);
     });
     labelCanvas.addEventListener('mousemove', (e) => {
-        if (isDrawing && activeImgId === imgId && !isSpaceDown) paint(e, imgMeta);
+        if (isDrawing && activeImgId === imgId && !isSpaceDown) {
+            if (e.buttons !== 1) {
+                isDrawing   = false;
+                activeImgId = null;
+                if (appState.liveUpdate) scheduleTrainAndPredictAll();
+            } else {
+                paint(e, imgMeta);
+            }
+        }
     });
     labelCanvas.addEventListener('mouseup', () => {
         if (activeImgId === imgId) {
@@ -930,7 +939,23 @@ function handleSliceChange(imgId, arrIdx, value) {
 async function rerenderSlice(imgId) {
     const meta = appState.images.find(i => i.id === imgId);
     const res  = resourceMap.get(imgId);
-    if (!meta || !res || meta.shape.length <= 2) return;
+    if (!meta || !res) return;
+
+    const w = meta.shape[meta.axes.axisX];
+    const h = meta.shape[meta.axes.axisY];
+
+    // Update container and canvas dimensions if needed
+    if (res.container.style.width !== w + 'px') res.container.style.width = w + 'px';
+    if (res.container.style.height !== h + 'px') res.container.style.height = h + 'px';
+    if (res.gpuCanvas.width !== w) res.gpuCanvas.width = w;
+    if (res.gpuCanvas.height !== h) res.gpuCanvas.height = h;
+    if (res.labelCanvas.width !== w) res.labelCanvas.width = w;
+    if (res.labelCanvas.height !== h) res.labelCanvas.height = h;
+
+    if (meta.shape.length <= 2) {
+        redrawLabels(imgId);
+        return;
+    }
 
     const slice = pickSlice(
         res.intensityArray, meta.shape, meta.axes, meta.sliceIndices
@@ -951,16 +976,60 @@ async function rerenderSlice(imgId) {
         rgba[i*4+3] = 255;
     }
 
-    await res.backend.allocateImage(meta.shape[meta.axes.axisY], meta.shape[meta.axes.axisX], rgba);
+    await res.backend.allocateImage(w, h, rgba);
     await res.backend.updateFeatures(slice, appState.sigma);
+    
+    redrawLabels(imgId);
+
     if (appState.liveUpdate) scheduleTrainAndPredictAll();
+}
+
+function isLabelVisible(label, meta) {
+    let sliceIdx = 0;
+    for (let d = 0; d < meta.shape.length; d++) {
+        if (d !== meta.axes.axisY && d !== meta.axes.axisX) {
+            if (label.coords[d] !== meta.sliceIndices[sliceIdx++]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function redrawLabels(imgId) {
+    const meta = appState.images.find(i => i.id === imgId);
+    const res  = resourceMap.get(imgId);
+    if (!meta || !res) return;
+
+    const ctx = res.labelCanvas.getContext('2d');
+    ctx.clearRect(0, 0, res.labelCanvas.width, res.labelCanvas.height);
+
+    for (const l of meta.labels) {
+        if (isLabelVisible(l, meta)) {
+            const x = l.coords[meta.axes.axisX];
+            const y = l.coords[meta.axes.axisY];
+            ctx.fillStyle = LABEL_COLORS[l.cls] ?? LABEL_COLORS[0];
+            ctx.beginPath();
+            ctx.arc(x, y, l.radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
 }
 
 // ── Sigma change ──────────────────────────────────────────────────────────────
 async function handleSigmaChange(sigma) {
     for (const meta of appState.images) {
         const res = resourceMap.get(meta.id);
-        if (res) await res.backend.updateFeatures(res.intensityArray, sigma);
+        if (res) {
+            if (meta.shape.length <= 2) {
+                await res.backend.updateFeatures(res.intensityArray, sigma);
+            } else {
+                const slice = pickSlice(
+                    res.intensityArray, meta.shape, meta.axes, meta.sliceIndices
+                );
+                await res.backend.updateFeatures(slice, sigma);
+            }
+        }
     }
     if (appState.liveUpdate) scheduleTrainAndPredictAll();
 }
@@ -980,20 +1049,37 @@ function paint(e, imgMeta) {
     const h      = imgMeta.shape[imgMeta.axes.axisY];
 
     if (appState.isEraser) {
-        ctx.globalCompositeOperation = 'destination-out';
-        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-        imgMeta.labels = eraseLabelsInRadius(imgMeta.labels, x, y, radius);
+        imgMeta.labels = eraseLabelsInRadius(imgMeta.labels, x, y, radius, imgMeta.axes, imgMeta);
+        redrawLabels(imgMeta.id);
     } else {
-        const last  = imgMeta.labels[imgMeta.labels.length - 1];
-        const isDup = last && last.x === x && last.y === y && last.cls === appState.currentClass;
+        const coords = new Array(imgMeta.shape.length);
+        coords[imgMeta.axes.axisY] = y;
+        coords[imgMeta.axes.axisX] = x;
+        let sliceIdx = 0;
+        for (let d = 0; d < imgMeta.shape.length; d++) {
+            if (d !== imgMeta.axes.axisY && d !== imgMeta.axes.axisX) {
+                coords[d] = imgMeta.sliceIndices[sliceIdx++];
+            }
+        }
+
+        const last = imgMeta.labels[imgMeta.labels.length - 1];
+        let isDup = false;
+        if (last && last.cls === appState.currentClass) {
+            isDup = true;
+            for (let d = 0; d < imgMeta.shape.length; d++) {
+                if (last.coords[d] !== coords[d]) {
+                    isDup = false;
+                    break;
+                }
+            }
+        }
+
         if (!isDup && x >= 0 && x < w && y >= 0 && y < h) {
             ctx.fillStyle = LABEL_COLORS[appState.currentClass] ?? LABEL_COLORS[0];
             ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-            imgMeta.labels.push({ x, y, cls: appState.currentClass });
+            imgMeta.labels.push({ coords, cls: appState.currentClass, radius });
         }
     }
-    // imgMeta.labels is reactive — ImageRow badge re-renders automatically
 }
 
 // ── Training ──────────────────────────────────────────────────────────────────
@@ -1002,8 +1088,8 @@ async function trainAndPredictAll() {
     if (totalLabels < MIN_LABELS_TO_TRAIN) return;
 
     // Build training dataset using imgMeta (labels) + resources (intensityArray via backend)
-    const { combinedX, yArray } = await buildTrainingDataset(appState.images, resourceMap, totalLabels);
-    rf.train(combinedX, yArray, RF_CONFIG.numTrees);
+    const { combinedX, yArray } = await buildTrainingDataset(appState.images, resourceMap, totalLabels, appState.sigma);
+    rf.train(combinedX, yArray, 8);
 
     for (const meta of appState.images) {
         const res = resourceMap.get(meta.id);
