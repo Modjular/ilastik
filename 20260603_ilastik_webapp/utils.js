@@ -80,7 +80,7 @@ export async function writeFile(folderHandle, filename, image) {
 /**
  * Aggregates features and labels across all images into 1D typed arrays for Random Forest training.
  */
-export async function buildTrainingDataset(images, totalLabels) {
+export async function buildTrainingDataset(images, resourceMap, totalLabels) {
     const allX = [];
     const yArray = new Int32Array(totalLabels);
     let currentLabelOffset = 0;
@@ -96,7 +96,7 @@ export async function buildTrainingDataset(images, totalLabels) {
             yArray[currentLabelOffset + i] = l.cls;
         }
 
-        const X_img = await img.backend.gatherFeaturesForTraining(indicesArray);
+        const X_img = await resourceMap.get(img.id).backend.gatherFeaturesForTraining(indicesArray);
         allX.push(X_img);
         currentLabelOffset += numLabels;
     }

@@ -5,8 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Web Ilastik</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎨</text></svg>">
+
+    <!-- Vue 3 — sidebar only, no build step -->
+    <script src="https://unpkg.com/vue@3/dist/vue.esm-browser.js" type="importmap-shim"></script>
+
     <style>
-        /* ── Reset / Base ─────────────────────────────────────────────────── */
+        /* ── Reset / Base ────────────────────────────────────────────────── */
         *, *::before, *::after { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -16,7 +20,7 @@
             height: 100vh; overflow: hidden;
         }
 
-        /* ── Top bar ──────────────────────────────────────────────────────── */
+        /* ── Top bar ─────────────────────────────────────────────────────── */
         #top-bar {
             padding: 10px 20px; background: #2d2d2d;
             border-bottom: 1px solid #3d3d3d;
@@ -24,10 +28,10 @@
             flex-shrink: 0;
         }
 
-        /* ── Layout ───────────────────────────────────────────────────────── */
+        /* ── Layout ──────────────────────────────────────────────────────── */
         #main-container { flex: 1; display: flex; overflow: hidden; }
 
-        /* ── Sidebar ──────────────────────────────────────────────────────── */
+        /* ── Sidebar (Vue mounts here) ───────────────────────────────────── */
         #sidebar {
             width: 270px; background: #252526;
             border-right: 1px solid #3d3d3d;
@@ -36,7 +40,7 @@
         }
 
         /* Phase tab strip */
-        #phase-tabs {
+        .phase-tabs {
             display: flex; flex-shrink: 0;
             border-bottom: 1px solid #3d3d3d;
         }
@@ -52,21 +56,24 @@
 
         /* Phase panels */
         .phase-panel {
-            display: none; flex-direction: column; gap: 14px;
+            display: flex; flex-direction: column; gap: 14px;
             padding: 16px; overflow-y: auto; flex: 1;
         }
-        .phase-panel.active { display: flex; }
 
-        /* ── Generic controls ─────────────────────────────────────────────── */
+        /* ── Generic controls ────────────────────────────────────────────── */
         .control-group { display: flex; flex-direction: column; gap: 6px; }
         .control-label {
             font-size: 11px; color: #888;
             text-transform: uppercase; letter-spacing: 0.5px;
         }
-        input[type="range"] { width: 100%; accent-color: #007acc; }
+        input[type="range"]  { width: 100%; accent-color: #007acc; }
         input[type="number"] {
             background: #333; border: 1px solid #555; color: #eee;
             border-radius: 3px; padding: 4px 6px;
+        }
+        select {
+            background: #333; border: 1px solid #555; color: #eee;
+            border-radius: 3px; padding: 3px 5px; font-size: 11px; width: 100%;
         }
 
         /* Buttons */
@@ -77,37 +84,38 @@
         }
         button:hover:not(:disabled) { background: #0062cc; }
         button:disabled { background: #3a3a3a; color: #666; cursor: not-allowed; }
-        .btn-danger  { background: #c0392b; }
-        .btn-danger:hover:not(:disabled)  { background: #a93226; }
         .btn-subtle  { background: #3a3a3a; }
         .btn-subtle:hover:not(:disabled)  { background: #444; }
         .btn-success { background: #28a745; }
         .btn-success:hover:not(:disabled) { background: #218838; }
+        .btn-danger  { background: #c0392b; }
+        .btn-danger:hover:not(:disabled)  { background: #a93226; }
 
-        /* ── Ingest: image list ───────────────────────────────────────────── */
-        #image-list {
-            display: flex; flex-direction: column; gap: 6px;
+        /* ── Image list (Ingest phase) ───────────────────────────────────── */
+        .img-list { display: flex; flex-direction: column; gap: 6px; }
+
+        .img-empty {
+            font-size: 12px; color: #555; text-align: center;
+            padding: 20px 0; line-height: 1.6;
         }
 
         .img-row {
             background: #2d2d2d; border: 1px solid #3d3d3d;
             border-radius: 5px; overflow: hidden;
         }
-
-        /* Top strip: reorder arrows + name + label badge + delete */
         .img-row-header {
-            display: flex; align-items: center; gap: 6px;
-            padding: 6px 8px;
+            display: flex; align-items: center; gap: 6px; padding: 6px 8px;
         }
-        .img-reorder {
-            display: flex; flex-direction: column; gap: 1px; flex-shrink: 0;
-        }
+        .img-row.loading .img-row-header { opacity: 0.5; pointer-events: none; }
+
+        .img-reorder { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
         .img-reorder button {
             background: none; border: none; color: #666;
             padding: 0; font-size: 10px; line-height: 1;
             cursor: pointer; font-weight: normal;
         }
         .img-reorder button:hover { color: #ccc; background: none; }
+
         .img-name {
             flex: 1; font-size: 12px; color: #ccc;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -118,66 +126,39 @@
             padding: 2px 5px; white-space: nowrap;
         }
         .img-label-badge.has-labels { color: #4CAF50; }
+
         .img-delete {
             flex-shrink: 0; background: none; border: none;
-            color: #666; font-size: 13px; cursor: pointer; padding: 2px 4px;
-            border-radius: 3px; line-height: 1;
+            color: #666; font-size: 13px; cursor: pointer;
+            padding: 2px 4px; border-radius: 3px; line-height: 1;
         }
         .img-delete:hover { background: #c0392b; color: white; }
 
-        /* Loading spinner row (shown while image loads) */
-        .img-row.loading .img-row-header { opacity: 0.5; pointer-events: none; }
+        /* Loading bar */
         .img-loading-bar {
             height: 2px; background: #007acc;
             animation: indeterminate 1.2s linear infinite;
-            display: none;
         }
-        .img-row.loading .img-loading-bar { display: block; }
         @keyframes indeterminate {
             0%   { margin-left: 0%;   width: 30%; }
             50%  { margin-left: 50%;  width: 30%; }
             100% { margin-left: 100%; width: 0%;  }
         }
 
-        /* Axis selector (only shown for ndim > 2) */
-        .img-axes {
-            display: none; /* shown via JS when ndim > 2 */
-            flex-direction: column; gap: 6px;
-            padding: 8px; border-top: 1px solid #3d3d3d;
-            background: #222;
+        /* Axis / slice sections (ndim > 2 only) */
+        .img-axes, .img-slice {
+            display: flex; flex-direction: column; gap: 6px;
+            padding: 8px; border-top: 1px solid #3d3d3d; background: #222;
         }
-        .img-axes.visible { display: flex; }
-        .img-axes-row {
+        .img-axes-row, .img-slice-row {
             display: flex; align-items: center; gap: 8px; font-size: 11px;
         }
         .img-axes-row label { color: #888; width: 14px; flex-shrink: 0; }
-        .img-axes-row select {
-            flex: 1; background: #333; border: 1px solid #555;
-            color: #eee; border-radius: 3px; padding: 3px 5px; font-size: 11px;
-        }
-
-        /* Slice slider (only shown for ndim > 2) */
-        .img-slice {
-            display: none;
-            flex-direction: column; gap: 4px;
-            padding: 6px 8px 8px; border-top: 1px solid #3d3d3d;
-            background: #222;
-        }
-        .img-slice.visible { display: flex; }
-        .img-slice-row {
-            display: flex; align-items: center; gap: 8px; font-size: 11px;
-        }
-        .img-slice-row label { color: #888; min-width: 14px; }
+        .img-slice-row label { color: #888; min-width: 20px; }
         .img-slice-row input[type="range"] { flex: 1; }
-        .img-slice-row span { color: #aaa; min-width: 28px; text-align: right; }
+        .img-slice-row span { color: #aaa; min-width: 32px; text-align: right; }
 
-        /* Empty state */
-        #img-empty {
-            font-size: 12px; color: #555; text-align: center;
-            padding: 20px 0; line-height: 1.6;
-        }
-
-        /* ── Train phase ──────────────────────────────────────────────────── */
+        /* ── Train phase ─────────────────────────────────────────────────── */
         .class-selector { display: flex; flex-direction: column; gap: 4px; }
         .class-item {
             display: flex; align-items: center; gap: 10px;
@@ -187,7 +168,7 @@
         .class-item.active { border-color: #007acc; background: #3d3d3d; }
         .color-box { width: 14px; height: 14px; border-radius: 2px; flex-shrink: 0; }
 
-        /* ── Viewport ─────────────────────────────────────────────────────── */
+        /* ── Viewport (vanilla — Vue never touches this) ─────────────────── */
         #viewport {
             flex: 1; position: relative; background: #000;
             overflow: hidden; transition: background 0.2s;
@@ -200,12 +181,9 @@
             align-items: flex-start;
         }
 
-        /* Each image tile */
         .image-container {
             position: relative; flex-shrink: 0;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-            background: #111;
-            display: flex; flex-direction: column;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5); background: #111;
         }
         .image-tile-label {
             position: absolute; bottom: 0; left: 0; right: 0;
@@ -219,66 +197,357 @@
         .gpu-canvas   { z-index: 1; }
         .label-canvas { z-index: 2; cursor: crosshair; }
 
-        /* Spacebar pan cursors */
-        body.space-down .label-canvas  { cursor: grab    !important; }
+        body.space-down  .label-canvas { cursor: grab     !important; }
         body.space-down.panning .label-canvas { cursor: grabbing !important; }
 
-        /* ── Misc ─────────────────────────────────────────────────────────── */
+        /* ── Misc ────────────────────────────────────────────────────────── */
         #status { font-size: 12px; color: #888; }
-        .hint { font-size: 11px; color: #555; line-height: 1.5; }
-        hr.divider { border: none; border-top: 1px solid #3d3d3d; margin: 0; }
+        .hint   { font-size: 11px; color: #555; line-height: 1.5; margin: 0; }
+        .divider { border: none; border-top: 1px solid #3d3d3d; margin: 0; }
     </style>
 </head>
 <body>
 
-<!-- ── Top bar ────────────────────────────────────────────────────────────── -->
+<!-- ── Top bar ───────────────────────────────────────────────────────────── -->
 <div id="top-bar">
     <h2 style="margin:0; font-size:18px; color:#007acc;">
         ilastik <span style="color:#eee; font-weight:300;">webgpu</span>
     </h2>
-    <!-- File input kept here for keyboard/assistive access; drag-drop on viewport -->
     <input type="file" id="fileInput" accept=".tif,.tiff,.png,.jpg,.jpeg"
            multiple style="font-size:12px;">
     <div id="status">No images loaded. Drag &amp; drop onto the canvas.</div>
 </div>
 
-<!-- ── Main layout ────────────────────────────────────────────────────────── -->
+<!-- ── Main layout ───────────────────────────────────────────────────────── -->
 <div id="main-container">
 
-    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
-    <div id="sidebar">
+    <!-- Vue mounts here — everything inside is declarative -->
+    <div id="sidebar"></div>
 
-        <!-- Phase tab strip -->
-        <div id="phase-tabs">
-            <button class="phase-tab active" data-phase="ingest">Images</button>
-            <button class="phase-tab"        data-phase="train" >Train</button>
-            <button class="phase-tab"        data-phase="export">Export</button>
+    <!-- Viewport — vanilla JS only, Vue never touches this subtree -->
+    <div id="viewport">
+        <div id="canvas-board"></div>
+    </div>
+
+</div>
+
+<script type="module">
+import {
+    createApp, reactive, computed, ref,
+} from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js';
+
+import { FlatRandomForest }  from './rf.js';
+import { WebGpuBackend }     from './backends/webgpu.js';
+import {
+    loadFileIntoArray,
+    verifyPermission,
+    writeFile,
+    buildTrainingDataset,
+    eraseLabelsInRadius,
+    exportImagesData,
+    inferAxes,
+    pickSlice,
+    isDuplicateFile,
+} from './utils.js';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const RF_CONFIG              = { numTrees: 8, maxDepth: 8 };
+const MIN_LABELS_TO_TRAIN    = 5;
+const CAMERA_ZOOM_MIN        = 0.1;
+const CAMERA_ZOOM_MAX        = 10;
+const CAMERA_ZOOM_SENSITIVITY = 0.01;
+const TRAIN_DEBOUNCE_MS      = 300;
+const LABEL_COLORS           = [
+    'rgba(255,0,0,0.5)',
+    'rgba(0,255,0,0.5)',
+    'rgba(0,0,255,0.5)',
+];
+
+// ── Resource map — GPU handles, canvas refs, raw arrays ──────────────────────
+// Never passed to Vue. Keyed by imgMeta.id.
+// Shape: { backend, gpuCanvas, labelCanvas, container, intensityArray,
+//          _cachedRect, _ro }
+const resourceMap = new Map();
+
+// ── Reactive state — Vue owns this ───────────────────────────────────────────
+// imgMeta shape: { id, name, fileSize, shape, axes, sliceIndices,
+//                  nonDisplayDims, labels[] }
+const appState = reactive({
+    images:       [],       // array of imgMeta — Vue v-for source
+    currentClass: 0,
+    sigma:        1.0,
+    isEraser:     false,
+    liveUpdate:   false,
+    outputDirHandle: null,
+    exportSeg:    true,
+    exportProb:   false,
+    exportStatus: '',       // feedback string for Export panel
+    hasDirectoryPicker: ('showDirectoryPicker' in window),
+    dirLabel:     'ZIP download (default)',
+});
+
+// Drawing / camera flags — change at 60 fps, Vue has no business watching them
+let isDrawing    = false;
+let activeImgId  = null;
+let isSpaceDown  = false;
+let isPanning    = false;
+const camera     = { x: 0, y: 0, scale: 1 };
+const rf         = new FlatRandomForest(RF_CONFIG);
+
+// ── Debounced train ───────────────────────────────────────────────────────────
+let _trainTimer = null;
+function scheduleTrainAndPredictAll() {
+    clearTimeout(_trainTimer);
+    _trainTimer = setTimeout(trainAndPredictAll, TRAIN_DEBOUNCE_MS);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Vue Components
+// ────────────────────────────────────────────────────────────────────────────
+
+// ── SliceSliders ─────────────────────────────────────────────────────────────
+// Props:  nonDisplayDims [{ i, size }], sliceIndices [number]
+// Emits:  slice-change { arrIdx, value }
+const SliceSliders = {
+    props: ['nonDisplayDims', 'sliceIndices'],
+    emits: ['slice-change'],
+    template: `
+        <div class="img-slice">
+            <div
+                v-for="(dim, arrIdx) in nonDisplayDims"
+                :key="dim.i"
+                class="img-slice-row"
+            >
+                <label>D{{ dim.i }}</label>
+                <input
+                    type="range" :min="0" :max="dim.size - 1"
+                    :value="sliceIndices[arrIdx]"
+                    @input="$emit('slice-change', { arrIdx, value: +$event.target.value })"
+                />
+                <span>{{ sliceIndices[arrIdx] }}/{{ dim.size - 1 }}</span>
+            </div>
         </div>
+    `,
+};
 
-        <!-- ── Phase 1: Ingest ────────────────────────────────────────── -->
-        <div class="phase-panel active" id="panel-ingest">
+// ── AxisSelector ─────────────────────────────────────────────────────────────
+// Props:  shape [number], axes { axisY, axisX }
+// Emits:  axis-change { role: 'Y'|'X', axisIdx }
+const AxisSelector = {
+    props: ['shape', 'axes'],
+    emits: ['axis-change'],
+    computed: {
+        dimOptions() {
+            return this.shape.map((size, i) => ({ value: i, label: `Dim ${i} (${size})` }));
+        },
+    },
+    template: `
+        <div class="img-axes">
+            <div class="img-axes-row" v-for="role in ['Y','X']" :key="role">
+                <label>{{ role }}</label>
+                <select
+                    :value="role === 'Y' ? axes.axisY : axes.axisX"
+                    @change="$emit('axis-change', { role, axisIdx: +$event.target.value })"
+                >
+                    <option v-for="opt in dimOptions" :key="opt.value" :value="opt.value">
+                        {{ opt.label }}
+                    </option>
+                </select>
+            </div>
+        </div>
+    `,
+};
 
-            <div id="img-empty">
+// ── ImageRow ──────────────────────────────────────────────────────────────────
+// Props:  meta (imgMeta), isFirst, isLast
+// Emits:  reorder { direction: -1|1 }, delete
+const ImageRow = {
+    props: ['meta', 'isFirst', 'isLast'],
+    emits: ['reorder', 'delete'],
+    components: { AxisSelector, SliceSliders },
+    computed: {
+        labelText() {
+            const n = this.meta.labels.length;
+            return n === 0 ? 'no labels' : `${n} label${n !== 1 ? 's' : ''}`;
+        },
+        isMultiDim() {
+            return this.meta.shape.length > 2;
+        },
+    },
+    template: `
+        <div class="img-row" :class="{ loading: meta.loading }">
+            <div class="img-loading-bar" v-if="meta.loading"></div>
+            <div class="img-row-header">
+                <div class="img-reorder">
+                    <button :disabled="isFirst" @click="$emit('reorder', { direction: -1 })" title="Move up">▲</button>
+                    <button :disabled="isLast"  @click="$emit('reorder', { direction: +1 })" title="Move down">▼</button>
+                </div>
+                <div class="img-name" :title="meta.name">{{ meta.name }}</div>
+                <div class="img-label-badge" :class="{ 'has-labels': meta.labels.length > 0 }">
+                    {{ labelText }}
+                </div>
+                <button class="img-delete" :disabled="meta.loading"
+                        @click="$emit('delete')" title="Remove image">✕</button>
+            </div>
+            <template v-if="!meta.loading && isMultiDim">
+                <AxisSelector
+                    :shape="meta.shape"
+                    :axes="meta.axes"
+                    @axis-change="onAxisChange"
+                />
+                <SliceSliders
+                    :nonDisplayDims="meta.nonDisplayDims"
+                    :sliceIndices="meta.sliceIndices"
+                    @slice-change="onSliceChange"
+                />
+            </template>
+        </div>
+    `,
+    methods: {
+        onAxisChange({ role, axisIdx }) {
+            handleAxisChange(this.meta.id, role, axisIdx);
+        },
+        onSliceChange({ arrIdx, value }) {
+            handleSliceChange(this.meta.id, arrIdx, value);
+        },
+    },
+};
+
+// ── ImageList ─────────────────────────────────────────────────────────────────
+// Props:  images []
+// Emits:  reorder { id, direction }, delete { id }
+const ImageList = {
+    props: ['images'],
+    emits: ['reorder', 'delete'],
+    components: { ImageRow },
+    template: `
+        <div class="img-list">
+            <div v-if="images.length === 0" class="img-empty">
                 Drop images onto the canvas<br>or use the file picker above.
             </div>
+            <ImageRow
+                v-for="(meta, idx) in images"
+                :key="meta.id"
+                :meta="meta"
+                :isFirst="idx === 0"
+                :isLast="idx === images.length - 1"
+                @reorder="e => $emit('reorder', { id: meta.id, direction: e.direction })"
+                @delete="$emit('delete', { id: meta.id })"
+            />
+        </div>
+    `,
+};
 
-            <div id="image-list"></div>
+// ── PhasePanel ────────────────────────────────────────────────────────────────
+// Root sidebar component. Owns activePhase locally; receives appState as prop.
+const PhasePanel = {
+    props: ['state'],
+    components: { ImageList },
+    setup(props) {
+        const activePhase = ref('ingest');
+        const exportBusy  = ref(false);
 
+        // Computed helpers used in the template
+        const totalLabels = computed(() =>
+            props.state.images.reduce((s, i) => s + i.labels.length, 0)
+        );
+        const canExport = computed(() =>
+            props.state.images.length > 0 && !exportBusy.value
+        );
+        const exportCount = computed(() => props.state.images.length);
+
+        return { activePhase, exportBusy, totalLabels, canExport, exportCount };
+    },
+    methods: {
+        onReorder({ id, direction }) { handleReorder(id, direction); },
+        onDelete({ id })             { handleDelete(id); },
+
+        onSigmaInput(e) {
+            appState.sigma = parseFloat(e.target.value);
+            handleSigmaChange(appState.sigma);
+        },
+        onToggleEraser() {
+            appState.isEraser = !appState.isEraser;
+        },
+        onSelectClass(cls) {
+            appState.currentClass = cls;
+        },
+        onToggleLiveUpdate() {
+            appState.liveUpdate = !appState.liveUpdate;
+            if (appState.liveUpdate) trainAndPredictAll();
+        },
+
+        async onSetDir() {
+            try {
+                appState.outputDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                appState.dirLabel = `/${appState.outputDirHandle.name}/`;
+            } catch (err) { console.warn(err); }
+        },
+
+        async onExport() {
+            if (!appState.exportSeg && !appState.exportProb) {
+                alert('Select at least one export option.');
+                return;
+            }
+            if (this.totalLabels < MIN_LABELS_TO_TRAIN) {
+                alert(`Paint at least ${MIN_LABELS_TO_TRAIN} labels before exporting.`);
+                return;
+            }
+            this.exportBusy = true;
+            appState.exportStatus = 'Training…';
+            try {
+                await trainAndPredictAll();
+                appState.exportStatus = 'Exporting…';
+                await exportImagesData(appState.images, rf, {
+                    exportSeg:  appState.exportSeg,
+                    exportProb: appState.exportProb,
+                    outputDirHandle: appState.outputDirHandle,
+                    verifyPermission,
+                    writeFile,
+                });
+                alert('All images exported successfully!');
+            } catch (err) {
+                console.error(err);
+                alert(`Export failed: ${err.message}`);
+            } finally {
+                this.exportBusy = false;
+                appState.exportStatus = '';
+            }
+        },
+    },
+
+    template: `
+        <div class="phase-tabs">
+            <button
+                v-for="phase in ['ingest','train','export']"
+                :key="phase"
+                class="phase-tab"
+                :class="{ active: activePhase === phase }"
+                @click="activePhase = phase"
+            >{{ { ingest: 'Images', train: 'Train', export: 'Export' }[phase] }}</button>
+        </div>
+
+        <!-- ── Images ──────────────────────────────────────────────── -->
+        <div v-show="activePhase === 'ingest'" class="phase-panel">
+            <ImageList
+                :images="state.images"
+                @reorder="onReorder"
+                @delete="onDelete"
+            />
             <p class="hint">
                 Drag files onto the canvas to load them.<br>
                 Use ▲▼ to reorder. Delete removes labels &amp; retrains.
             </p>
         </div>
 
-        <!-- ── Phase 2: Train ─────────────────────────────────────────── -->
-        <div class="phase-panel" id="panel-train">
-
+        <!-- ── Train ───────────────────────────────────────────────── -->
+        <div v-show="activePhase === 'train'" class="phase-panel">
             <div class="control-group">
                 <span class="control-label">Feature Scale (Sigma)</span>
                 <div style="display:flex; gap:10px; align-items:center;">
-                    <input type="range" id="sigmaRange" min="0.3" max="10.0"
-                           step="0.1" value="1.0" style="flex:1;">
-                    <span id="sigmaVal" style="min-width:30px; font-size:12px;">1.0</span>
+                    <input type="range" min="0.3" max="10.0" step="0.1"
+                           :value="state.sigma" @input="onSigmaInput" style="flex:1;">
+                    <span style="min-width:30px; font-size:12px;">{{ state.sigma.toFixed(1) }}</span>
                 </div>
             </div>
 
@@ -287,54 +556,57 @@
                 <div style="display:flex; gap:10px; align-items:center;">
                     <input type="number" id="brushSize" value="5"
                            min="1" max="50" step="1" style="width:60px;">
-                    <button id="btnEraser" class="btn-subtle" style="flex:1;">
-                        Eraser: OFF
-                    </button>
+                    <button
+                        :class="state.isEraser ? 'btn-danger' : 'btn-subtle'"
+                        style="flex:1;"
+                        @click="onToggleEraser"
+                    >Eraser: {{ state.isEraser ? 'ON' : 'OFF' }}</button>
                 </div>
             </div>
 
             <div class="control-group">
                 <span class="control-label">Classes</span>
                 <div class="class-selector">
-                    <div class="class-item active" data-class="0">
-                        <div class="color-box" style="background:red;"></div>
-                        <span>Class 1</span>
-                    </div>
-                    <div class="class-item" data-class="1">
-                        <div class="color-box" style="background:green;"></div>
-                        <span>Class 2</span>
-                    </div>
-                    <div class="class-item" data-class="2">
-                        <div class="color-box" style="background:blue;"></div>
-                        <span>Class 3</span>
+                    <div
+                        v-for="(cls, idx) in [
+                            { label: 'Class 1', color: 'red'   },
+                            { label: 'Class 2', color: 'green' },
+                            { label: 'Class 3', color: 'blue'  },
+                        ]"
+                        :key="idx"
+                        class="class-item"
+                        :class="{ active: state.currentClass === idx }"
+                        @click="onSelectClass(idx)"
+                    >
+                        <div class="color-box" :style="{ background: cls.color }"></div>
+                        <span>{{ cls.label }}</span>
                     </div>
                 </div>
             </div>
 
             <hr class="divider">
 
-            <button id="btnTrain" disabled>Live Update: OFF</button>
+            <button
+                :disabled="state.images.length === 0"
+                :style="{ background: state.liveUpdate ? '#4CAF50' : '' }"
+                @click="onToggleLiveUpdate"
+            >Live Update: {{ state.liveUpdate ? 'ON' : 'OFF' }}</button>
 
             <p class="hint">
-                Paint labels on the canvas, then enable Live Update to see
-                segmentation results in real time.
+                Paint labels on the canvas, then enable Live Update
+                to see segmentation results in real time.
             </p>
         </div>
 
-        <!-- ── Phase 3: Export ────────────────────────────────────────── -->
-        <div class="phase-panel" id="panel-export">
-
+        <!-- ── Export ──────────────────────────────────────────────── -->
+        <div v-show="activePhase === 'export'" class="phase-panel">
             <div class="control-group">
                 <span class="control-label">Export</span>
-                <label style="display:flex; align-items:center; gap:8px;
-                               font-size:13px; cursor:pointer;">
-                    <input type="checkbox" id="chkExportSeg" checked>
-                    Segmentations
+                <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                    <input type="checkbox" v-model="state.exportSeg"> Segmentations
                 </label>
-                <label style="display:flex; align-items:center; gap:8px;
-                               font-size:13px; cursor:pointer;">
-                    <input type="checkbox" id="chkExportProb">
-                    Probabilities
+                <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                    <input type="checkbox" v-model="state.exportProb"> Probabilities
                 </label>
             </div>
 
@@ -342,760 +614,410 @@
 
             <div class="control-group">
                 <span class="control-label">Destination</span>
-                <div id="dirStatus" style="font-size:11px; color:#888;
-                     word-break:break-all;">
-                    ZIP download (default)
+                <div style="font-size:11px; color:#888; word-break:break-all;">
+                    {{ state.dirLabel }}
                 </div>
-                <button id="btnSetDir" class="btn-subtle">
+                <button v-if="state.hasDirectoryPicker"
+                        class="btn-subtle" @click="onSetDir">
                     Set Output Folder…
                 </button>
             </div>
 
-            <button id="btnExportAll" class="btn-success" disabled>
-                Export Loaded Images
+            <button class="btn-success" :disabled="!canExport" @click="onExport">
+                <template v-if="exportBusy">{{ state.exportStatus }}</template>
+                <template v-else>
+                    Export Loaded Images{{ exportCount > 0 ? \` (\${exportCount})\` : '' }}
+                </template>
             </button>
 
-            <p class="hint">
-                At least 5 labels are needed to train before export.
-            </p>
+            <p class="hint">At least {{ $options.MIN_LABELS_TO_TRAIN }} labels needed to train before export.</p>
         </div>
+    `,
+    // expose constant to template
+    MIN_LABELS_TO_TRAIN,
+};
 
-    </div><!-- /sidebar -->
+// ── Mount Vue on #sidebar ─────────────────────────────────────────────────────
+const app = createApp({
+    components: { PhasePanel },
+    setup() { return { appState }; },
+    template: `<PhasePanel :state="appState" />`,
+});
+app.mount('#sidebar');
 
-    <!-- ── Viewport ─────────────────────────────────────────────────────── -->
-    <div id="viewport">
-        <div id="canvas-board"></div>
-    </div>
+// ────────────────────────────────────────────────────────────────────────────
+// Vanilla JS — camera, canvas, drawing, training
+// (Nothing below knows Vue exists)
+// ────────────────────────────────────────────────────────────────────────────
 
-</div><!-- /main-container -->
+// ── Camera ───────────────────────────────────────────────────────────────────
+(function setupCamera() {
+    const viewport = document.getElementById('viewport');
+    const board    = document.getElementById('canvas-board');
 
-<script type="module">
-    import { FlatRandomForest }    from './rf.js';
-    import { WebGpuBackend }       from './backends/webgpu.js';
-    import {
-        loadFileIntoArray,
-        verifyPermission,
-        writeFile,
-        buildTrainingDataset,
-        eraseLabelsInRadius,
-        exportImagesData,
-        inferAxes,
-        pickSlice,
-        isDuplicateFile,
-    } from './utils.js';
-
-    // ── Constants ────────────────────────────────────────────────────────────
-    const RF_CONFIG             = { numTrees: 8, maxDepth: 8 };
-    const MIN_LABELS_TO_TRAIN   = 5;
-    const CAMERA_ZOOM_MIN       = 0.1;
-    const CAMERA_ZOOM_MAX       = 10;
-    const CAMERA_ZOOM_SENSITIVITY = 0.01;
-    const TRAIN_DEBOUNCE_MS     = 300;
-    const LABEL_COLORS          = [
-        'rgba(255,0,0,0.5)',
-        'rgba(0,255,0,0.5)',
-        'rgba(0,0,255,0.5)',
-    ];
-
-    // ── State ─────────────────────────────────────────────────────────────────
-    const state = {
-        // Images — ordered array; visual order == export order
-        images: [],
-
-        // ML
-        rf: new FlatRandomForest(RF_CONFIG),
-
-        // Drawing
-        currentClass: 0,
-        isDrawing:    false,
-        activeImageId: null,
-        isEraser:     false,
-
-        // Features
-        sigma: 1.0,
-
-        // Live update
-        liveUpdate: false,
-
-        // Camera
-        camera: { x: 0, y: 0, scale: 1 },
-        isSpaceDown: false,
-        isPanning:   false,
-
-        // Export
-        outputDirHandle: null,
-    };
-
-    // ── Debounced train ───────────────────────────────────────────────────────
-    let _trainTimer = null;
-    function scheduleTrainAndPredictAll() {
-        clearTimeout(_trainTimer);
-        _trainTimer = setTimeout(() => trainAndPredictAll(), TRAIN_DEBOUNCE_MS);
+    function updateBoard() {
+        board.style.transform =
+            `translate(${camera.x}px, ${camera.y}px) scale(${camera.scale})`;
     }
 
-    // ── Boot ──────────────────────────────────────────────────────────────────
-    function init() {
-        setupCamera();
-        setupUI();
-    }
-
-    // ── Camera ────────────────────────────────────────────────────────────────
-    function setupCamera() {
-        const viewport = document.getElementById('viewport');
-        const board    = document.getElementById('canvas-board');
-
-        function updateBoard() {
-            board.style.transform =
-                `translate(${state.camera.x}px, ${state.camera.y}px) ` +
-                `scale(${state.camera.scale})`;
-        }
-
-        viewport.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            if (e.ctrlKey || e.metaKey) {
-                const delta    = -e.deltaY * CAMERA_ZOOM_SENSITIVITY;
-                const newScale = Math.min(
-                    Math.max(CAMERA_ZOOM_MIN, state.camera.scale * Math.exp(delta)),
-                    CAMERA_ZOOM_MAX
-                );
-                const rect   = viewport.getBoundingClientRect();
-                const mouseX = e.clientX - rect.left;
-                const mouseY = e.clientY - rect.top;
-                const boardX = (mouseX - state.camera.x) / state.camera.scale;
-                const boardY = (mouseY - state.camera.y) / state.camera.scale;
-                state.camera.scale = newScale;
-                state.camera.x = mouseX - boardX * state.camera.scale;
-                state.camera.y = mouseY - boardY * state.camera.scale;
-            } else {
-                state.camera.x -= e.deltaX;
-                state.camera.y -= e.deltaY;
-            }
-            updateBoard();
-        }, { passive: false });
-
-        window.addEventListener('keydown', (e) => {
-            if (e.code === 'Space' && !state.isSpaceDown) {
-                state.isSpaceDown = true;
-                document.body.classList.add('space-down');
-            }
-        });
-        window.addEventListener('keyup', (e) => {
-            if (e.code === 'Space') {
-                state.isSpaceDown = false;
-                state.isPanning   = false;
-                document.body.classList.remove('space-down', 'panning');
-            }
-        });
-
-        viewport.addEventListener('mousedown', () => {
-            if (state.isSpaceDown) {
-                state.isPanning = true;
-                document.body.classList.add('panning');
-            }
-        });
-        window.addEventListener('mousemove', (e) => {
-            if (state.isPanning) {
-                state.camera.x += e.movementX;
-                state.camera.y += e.movementY;
-                updateBoard();
-            }
-        });
-        window.addEventListener('mouseup', () => {
-            state.isPanning = false;
-            document.body.classList.remove('panning');
-        });
-    }
-
-    // ── UI setup ─────────────────────────────────────────────────────────────
-    function setupUI() {
-        // Phase tabs
-        document.querySelectorAll('.phase-tab').forEach(tab => {
-            tab.onclick = () => {
-                document.querySelectorAll('.phase-tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.phase-panel').forEach(p => p.classList.remove('active'));
-                tab.classList.add('active');
-                document.getElementById(`panel-${tab.dataset.phase}`).classList.add('active');
-            };
-        });
-
-        // File input
-        document.getElementById('fileInput').onchange = (e) =>
-            handleFiles(e.target.files).catch(console.error);
-
-        // Viewport drag-and-drop
-        const viewport = document.getElementById('viewport');
-        viewport.ondragover  = (e) => { e.preventDefault(); viewport.classList.add('drag-active'); };
-        viewport.ondragleave = (e) => { e.preventDefault(); viewport.classList.remove('drag-active'); };
-        viewport.ondrop      = (e) => {
-            e.preventDefault();
-            viewport.classList.remove('drag-active');
-            handleFiles(e.dataTransfer.files).catch(console.error);
-        };
-
-        // Sigma
-        document.getElementById('sigmaRange').oninput = async (e) => {
-            state.sigma = parseFloat(e.target.value);
-            document.getElementById('sigmaVal').innerText = state.sigma.toFixed(1);
-            for (const img of state.images) {
-                await img.backend.updateFeatures(img.intensityArray, state.sigma);
-            }
-            if (state.liveUpdate) scheduleTrainAndPredictAll();
-        };
-
-        // Eraser
-        const btnEraser = document.getElementById('btnEraser');
-        btnEraser.onclick = () => {
-            state.isEraser = !state.isEraser;
-            btnEraser.innerText = state.isEraser ? 'Eraser: ON' : 'Eraser: OFF';
-            btnEraser.style.background = state.isEraser ? '#e51400' : '';
-            btnEraser.classList.toggle('btn-subtle', !state.isEraser);
-        };
-
-        // Class selector
-        document.querySelectorAll('.class-item').forEach(el => {
-            el.onclick = () => {
-                document.querySelectorAll('.class-item').forEach(i => i.classList.remove('active'));
-                el.classList.add('active');
-                state.currentClass = parseInt(el.dataset.class, 10);
-            };
-        });
-
-        // Live update
-        const btnTrain = document.getElementById('btnTrain');
-        btnTrain.onclick = () => {
-            state.liveUpdate = !state.liveUpdate;
-            btnTrain.innerText = state.liveUpdate ? 'Live Update: ON' : 'Live Update: OFF';
-            btnTrain.style.background = state.liveUpdate ? '#4CAF50' : '';
-            if (state.liveUpdate) trainAndPredictAll();
-        };
-
-        // Output folder
-        const btnSetDir  = document.getElementById('btnSetDir');
-        const dirStatus  = document.getElementById('dirStatus');
-        if (!('showDirectoryPicker' in window)) {
-            btnSetDir.style.display = 'none';
-            dirStatus.innerText = 'ZIP download (Folder API not supported)';
-        } else {
-            btnSetDir.onclick = async () => {
-                try {
-                    state.outputDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-                    dirStatus.innerText   = `/${state.outputDirHandle.name}/`;
-                    dirStatus.style.color = '#4CAF50';
-                } catch (err) { console.warn(err); }
-            };
-        }
-
-        // Export
-        const btnExport = document.getElementById('btnExportAll');
-        btnExport.onclick = async () => {
-            const exportSeg  = document.getElementById('chkExportSeg').checked;
-            const exportProb = document.getElementById('chkExportProb').checked;
-
-            if (!exportSeg && !exportProb) {
-                alert('Please select at least one export option.');
-                return;
-            }
-            const totalLabels = state.images.reduce((s, i) => s + i.labels.length, 0);
-            if (totalLabels < MIN_LABELS_TO_TRAIN) {
-                alert(`Paint at least ${MIN_LABELS_TO_TRAIN} labels before exporting.`);
-                return;
-            }
-
-            const origText = btnExport.innerText;
-            btnExport.disabled = true;
-            btnExport.innerText = 'Training…';
-            try {
-                await trainAndPredictAll();
-                btnExport.innerText = 'Exporting…';
-                await exportImagesData(state.images, state.rf, {
-                    exportSeg, exportProb,
-                    outputDirHandle: state.outputDirHandle,
-                    verifyPermission, writeFile,
-                });
-                alert('All images exported successfully!');
-            } catch (err) {
-                console.error(err);
-                alert(`Export failed: ${err.message}`);
-            } finally {
-                btnExport.disabled = false;
-                btnExport.innerText = origText;
-                updateExportButtonCount();
-            }
-        };
-    }
-
-    // ── File ingestion ────────────────────────────────────────────────────────
-    async function handleFiles(files) {
-        for (const file of files) {
-            if (!file.name.match(/\.(tif|tiff|png|jpg|jpeg)$/i)) continue;
-            // Deduplicate: skip if same name+size already loaded
-            if (isDuplicateFile(file, state.images)) {
-                console.info(`Skipping duplicate: ${file.name}`);
-                continue;
-            }
-            await addImage(file);
-        }
-    }
-
-    async function addImage(file) {
-        // ── 1. Create a placeholder row in the sidebar immediately ──────────
-        const imgId = crypto.randomUUID();
-        const row   = createImageRow(imgId, file.name, 0, null); // spinner state
-        row.classList.add('loading');
-        document.getElementById('img-empty').style.display = 'none';
-        document.getElementById('image-list').appendChild(row);
-
-        // ── 2. Load the file ────────────────────────────────────────────────
-        let loaded;
-        try {
-            loaded = await loadFileIntoArray(file);
-        } catch (err) {
-            console.error(err);
-            alert(`Failed to load ${file.name}: ${err.message}`);
-            row.remove();
-            refreshEmptyState();
-            return;
-        }
-        const { intensityArray, rgba, w, h, shape } = loaded;
-        // shape may be undefined for 2-D images from older loaders; normalise.
-        const imgShape = shape ?? [h, w];
-
-        // ── 3. Infer display axes (heuristic: last two dims) ────────────────
-        const axes = inferAxes(imgShape);
-        const isMultiDim = imgShape.length > 2;
-
-        // For each non-display axis, default slice index = 0
-        const nonDisplayDims = imgShape
-            .map((size, i) => ({ i, size }))
-            .filter(({ i }) => i !== axes.axisY && i !== axes.axisX);
-        const sliceIndices = nonDisplayDims.map(() => 0);
-
-        // ── 4. Build canvas tile ────────────────────────────────────────────
-        const container = document.createElement('div');
-        container.className = 'image-container';
-        container.style.width  = w + 'px';
-        container.style.height = h + 'px';
-
-        const gpuCanvas   = document.createElement('canvas');
-        gpuCanvas.className = 'gpu-canvas';
-        gpuCanvas.width = w; gpuCanvas.height = h;
-
-        const labelCanvas = document.createElement('canvas');
-        labelCanvas.className = 'label-canvas';
-        labelCanvas.width = w; labelCanvas.height = h;
-
-        const tileLabel = document.createElement('div');
-        tileLabel.className   = 'image-tile-label';
-        tileLabel.textContent = file.name;
-
-        container.appendChild(gpuCanvas);
-        container.appendChild(labelCanvas);
-        container.appendChild(tileLabel);
-        document.getElementById('canvas-board').appendChild(container);
-
-        // ── 5. Init WebGPU ──────────────────────────────────────────────────
-        const backend = new WebGpuBackend();
-        try {
-            await backend.initialize(gpuCanvas);
-        } catch (err) {
-            console.error(err);
-            alert('WebGPU not supported or initialization failed.');
-            container.remove();
-            row.remove();
-            refreshEmptyState();
-            return;
-        }
-        await backend.allocateImage(w, h, rgba);
-        await backend.updateFeatures(intensityArray, state.sigma);
-
-        // ── 6. Build image state object ─────────────────────────────────────
-        const imgState = {
-            id: imgId,
-            name: file.name,
-            fileSize: file.size,         // for dedup
-            backend,
-            width: w, height: h,
-            intensityArray,
-            shape: imgShape,
-            axes,                        // { axisY, axisX }
-            sliceIndices,                // one index per non-display axis
-            nonDisplayDims,              // [{ i, size }, …]
-            labels: [],
-            gpuCanvas, labelCanvas, container,
-            _cachedRect: null,
-            _sidebarRow: row,
-        };
-        state.images.push(imgState);
-
-        // ── 7. Wire canvas drawing events ───────────────────────────────────
-        labelCanvas.addEventListener('mousedown', (e) => {
-            if (state.isSpaceDown) return;
-            imgState._cachedRect = labelCanvas.getBoundingClientRect();
-            state.isDrawing    = true;
-            state.activeImageId = imgId;
-            paint(e, imgState);
-        });
-        labelCanvas.addEventListener('mousemove', (e) => {
-            if (state.isDrawing && state.activeImageId === imgId && !state.isSpaceDown) {
-                paint(e, imgState);
-            }
-        });
-        labelCanvas.addEventListener('mouseup', () => {
-            if (state.activeImageId === imgId) {
-                state.isDrawing    = false;
-                state.activeImageId = null;
-                if (state.liveUpdate) scheduleTrainAndPredictAll();
-            }
-        });
-
-        const ro = new ResizeObserver(() => { imgState._cachedRect = null; });
-        ro.observe(labelCanvas);
-
-        // ── 8. Finish sidebar row ────────────────────────────────────────────
-        row.classList.remove('loading');
-        finaliseImageRow(row, imgState);
-        if (isMultiDim) showAxesUI(row, imgState);
-
-        updateStatus();
-        updateTrainButton();
-        updateExportButtonCount();
-    }
-
-    // ── Sidebar row builders ──────────────────────────────────────────────────
-
-    // createImageRow — builds the DOM for one entry.
-    // imgState is null during the loading placeholder phase.
-    function createImageRow(imgId, name, labelCount, imgState) {
-        const row = document.createElement('div');
-        row.className  = 'img-row';
-        row.dataset.id = imgId;
-
-        // Loading bar (visible during load, hidden after)
-        const loadBar = document.createElement('div');
-        loadBar.className = 'img-loading-bar';
-
-        // Header strip
-        const header = document.createElement('div');
-        header.className = 'img-row-header';
-
-        // Reorder buttons
-        const reorder = document.createElement('div');
-        reorder.className = 'img-reorder';
-        const btnUp   = document.createElement('button');
-        const btnDown = document.createElement('button');
-        btnUp.textContent   = '▲';
-        btnDown.textContent = '▼';
-        btnUp.title   = 'Move up';
-        btnDown.title = 'Move down';
-        btnUp.onclick   = () => reorderImage(imgId, -1);
-        btnDown.onclick = () => reorderImage(imgId, +1);
-        reorder.appendChild(btnUp);
-        reorder.appendChild(btnDown);
-
-        // Filename
-        const nameEl = document.createElement('div');
-        nameEl.className   = 'img-name';
-        nameEl.textContent = name;
-        nameEl.title       = name;
-
-        // Label badge
-        const badge = document.createElement('div');
-        badge.className = 'img-label-badge';
-        badge.dataset.badge = imgId;
-        updateBadge(badge, labelCount);
-
-        // Delete button
-        const btnDel = document.createElement('button');
-        btnDel.className   = 'img-delete';
-        btnDel.textContent = '✕';
-        btnDel.title       = 'Remove image';
-        btnDel.onclick     = () => deleteImage(imgId);
-
-        header.appendChild(reorder);
-        header.appendChild(nameEl);
-        header.appendChild(badge);
-        header.appendChild(btnDel);
-
-        row.appendChild(loadBar);
-        row.appendChild(header);
-
-        return row;
-    }
-
-    // Called after load completes — attaches axis / slice UI placeholders.
-    function finaliseImageRow(row, imgState) {
-        // Axes section (hidden until needed)
-        const axesEl = document.createElement('div');
-        axesEl.className    = 'img-axes';
-        axesEl.dataset.axes = imgState.id;
-
-        const sliceEl = document.createElement('div');
-        sliceEl.className     = 'img-slice';
-        sliceEl.dataset.slice = imgState.id;
-
-        row.appendChild(axesEl);
-        row.appendChild(sliceEl);
-    }
-
-    // showAxesUI — populates and reveals axis selectors + slice sliders
-    // for images with more than 2 dimensions.
-    function showAxesUI(row, imgState) {
-        const { shape, axes, nonDisplayDims, sliceIndices } = imgState;
-        const axesEl = row.querySelector('.img-axes');
-        const sliceEl = row.querySelector('.img-slice');
-        axesEl.innerHTML = '';
-        sliceEl.innerHTML = '';
-
-        const dimLabels = shape.map((size, i) => `Dim ${i} (${size})`);
-
-        // Helper: rebuild select element for one axis role
-        function makeAxisSelect(role, currentAxisIdx) {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'img-axes-row';
-            const lbl = document.createElement('label');
-            lbl.textContent = role;
-            const sel = document.createElement('select');
-            shape.forEach((size, i) => {
-                const opt = document.createElement('option');
-                opt.value = i;
-                opt.textContent = dimLabels[i];
-                if (i === currentAxisIdx) opt.selected = true;
-                sel.appendChild(opt);
-            });
-            sel.onchange = () => onAxisChange(imgState, role, parseInt(sel.value, 10));
-            wrapper.appendChild(lbl);
-            wrapper.appendChild(sel);
-            return wrapper;
-        }
-
-        axesEl.appendChild(makeAxisSelect('Y', axes.axisY));
-        axesEl.appendChild(makeAxisSelect('X', axes.axisX));
-        axesEl.classList.add('visible');
-
-        // Slice sliders for each non-display dimension
-        nonDisplayDims.forEach(({ i: dimIdx, size }, arrIdx) => {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'img-slice-row';
-
-            const lbl = document.createElement('label');
-            lbl.textContent = `D${dimIdx}`;
-
-            const slider = document.createElement('input');
-            slider.type  = 'range';
-            slider.min   = 0;
-            slider.max   = size - 1;
-            slider.value = sliceIndices[arrIdx];
-            slider.dataset.dimIdx = dimIdx;
-
-            const valSpan = document.createElement('span');
-            valSpan.textContent = `${sliceIndices[arrIdx]}/${size - 1}`;
-
-            slider.oninput = () => {
-                const v = parseInt(slider.value, 10);
-                imgState.sliceIndices[arrIdx] = v;
-                valSpan.textContent = `${v}/${size - 1}`;
-                onSliceChange(imgState);
-            };
-
-            wrapper.appendChild(lbl);
-            wrapper.appendChild(slider);
-            wrapper.appendChild(valSpan);
-            sliceEl.appendChild(wrapper);
-        });
-        sliceEl.classList.add('visible');
-    }
-
-    // ── Axis / slice change handlers ──────────────────────────────────────────
-
-    function onAxisChange(imgState, role, newAxisIdx) {
-        if (role === 'Y') imgState.axes.axisY = newAxisIdx;
-        else              imgState.axes.axisX = newAxisIdx;
-
-        // Recompute which dims are non-display and re-render slice UI
-        imgState.nonDisplayDims = imgState.shape
-            .map((size, i) => ({ i, size }))
-            .filter(({ i }) => i !== imgState.axes.axisY && i !== imgState.axes.axisX);
-        imgState.sliceIndices = imgState.nonDisplayDims.map(() => 0);
-
-        const row = imgState._sidebarRow;
-        showAxesUI(row, imgState);
-        rerenderSlice(imgState);
-    }
-
-    function onSliceChange(imgState) {
-        rerenderSlice(imgState);
-    }
-
-    // rerenderSlice — extracts the chosen 2-D plane and pushes it to the GPU.
-    async function rerenderSlice(imgState) {
-        if (imgState.shape.length <= 2) return; // nothing to do for flat images
-
-        const slice = pickSlice(
-            imgState.intensityArray,
-            imgState.shape,
-            imgState.axes,
-            imgState.sliceIndices
-        );
-
-        // Re-derive RGBA from the new intensity slice (simple grey mapping)
-        const n    = slice.length;
-        const rgba = new Uint8ClampedArray(n * 4);
-        let min = Infinity, max = -Infinity;
-        for (let i = 0; i < n; i++) { if (slice[i] < min) min = slice[i]; if (slice[i] > max) max = slice[i]; }
-        const range = max - min || 1;
-        for (let i = 0; i < n; i++) {
-            const v = ((slice[i] - min) / range * 255) | 0;
-            rgba[i*4]   = v;
-            rgba[i*4+1] = v;
-            rgba[i*4+2] = v;
-            rgba[i*4+3] = 255;
-        }
-
-        await imgState.backend.allocateImage(imgState.width, imgState.height, rgba);
-        await imgState.backend.updateFeatures(slice, state.sigma);
-        if (state.liveUpdate) scheduleTrainAndPredictAll();
-    }
-
-    // ── Ingest list mutations ─────────────────────────────────────────────────
-
-    function reorderImage(imgId, direction) {
-        const idx = state.images.findIndex(i => i.id === imgId);
-        if (idx === -1) return;
-        const newIdx = idx + direction;
-        if (newIdx < 0 || newIdx >= state.images.length) return;
-
-        // Swap in state array
-        [state.images[idx], state.images[newIdx]] =
-        [state.images[newIdx], state.images[idx]];
-
-        // Reorder canvas tiles
-        const board = document.getElementById('canvas-board');
-        const tiles = [...board.children];
-        const a = tiles[idx];
-        const b = tiles[newIdx];
-        if (direction === -1) board.insertBefore(a, b);
-        else                  board.insertBefore(b, a);
-
-        // Reorder sidebar rows
-        const list = document.getElementById('image-list');
-        const rows = [...list.children];
-        const ra = rows[idx];
-        const rb = rows[newIdx];
-        if (direction === -1) list.insertBefore(ra, rb);
-        else                  list.insertBefore(rb, ra);
-    }
-
-    function deleteImage(imgId) {
-        const idx = state.images.findIndex(i => i.id === imgId);
-        if (idx === -1) return;
-
-        const imgState = state.images[idx];
-        const labelCount = imgState.labels.length;
-
-        if (labelCount > 0) {
-            const ok = confirm(
-                `"${imgState.name}" has ${labelCount} label${labelCount !== 1 ? 's' : ''}.\n` +
-                `Deleting it will remove those labels and retrain the model. Continue?`
+    viewport.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.ctrlKey || e.metaKey) {
+            const delta    = -e.deltaY * CAMERA_ZOOM_SENSITIVITY;
+            const newScale = Math.min(
+                Math.max(CAMERA_ZOOM_MIN, camera.scale * Math.exp(delta)),
+                CAMERA_ZOOM_MAX
             );
-            if (!ok) return;
-        }
-
-        // Remove canvas tile
-        imgState.container.remove();
-
-        // Remove sidebar row
-        imgState._sidebarRow.remove();
-
-        // Remove from state
-        state.images.splice(idx, 1);
-
-        // Retrain if we had labels
-        if (labelCount > 0 && state.liveUpdate) scheduleTrainAndPredictAll();
-
-        refreshEmptyState();
-        updateStatus();
-        updateTrainButton();
-        updateExportButtonCount();
-    }
-
-    // ── Label badge helper ────────────────────────────────────────────────────
-    function updateBadge(badgeEl, count) {
-        badgeEl.textContent = count === 0 ? 'no labels' : `${count} label${count !== 1 ? 's' : ''}`;
-        badgeEl.classList.toggle('has-labels', count > 0);
-    }
-
-    function refreshBadge(imgState) {
-        const badge = imgState._sidebarRow.querySelector('.img-label-badge');
-        if (badge) updateBadge(badge, imgState.labels.length);
-    }
-
-    // ── Painting ──────────────────────────────────────────────────────────────
-    function paint(e, imgState) {
-        const rect   = imgState._cachedRect || imgState.labelCanvas.getBoundingClientRect();
-        const scaleX = imgState.width  / rect.width;
-        const scaleY = imgState.height / rect.height;
-        const x      = Math.floor((e.clientX - rect.left) * scaleX);
-        const y      = Math.floor((e.clientY - rect.top)  * scaleY);
-        const radius = parseInt(document.getElementById('brushSize').value, 10);
-        const ctx    = imgState.labelCanvas.getContext('2d');
-
-        if (state.isEraser) {
-            ctx.globalCompositeOperation = 'destination-out';
-            ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-            ctx.globalCompositeOperation = 'source-over';
-            imgState.labels = eraseLabelsInRadius(imgState.labels, x, y, radius);
+            const rect   = viewport.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            const boardX = (mouseX - camera.x) / camera.scale;
+            const boardY = (mouseY - camera.y) / camera.scale;
+            camera.scale = newScale;
+            camera.x = mouseX - boardX * camera.scale;
+            camera.y = mouseY - boardY * camera.scale;
         } else {
-            const last = imgState.labels[imgState.labels.length - 1];
-            const isDup = last && last.x === x && last.y === y && last.cls === state.currentClass;
-
-            if (!isDup && x >= 0 && x < imgState.width && y >= 0 && y < imgState.height) {
-                ctx.fillStyle = LABEL_COLORS[state.currentClass] ?? LABEL_COLORS[0];
-                ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-                imgState.labels.push({ x, y, cls: state.currentClass });
-            }
+            camera.x -= e.deltaX;
+            camera.y -= e.deltaY;
         }
+        updateBoard();
+    }, { passive: false });
 
-        refreshBadge(imgState);
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' && !isSpaceDown) {
+            isSpaceDown = true;
+            document.body.classList.add('space-down');
+        }
+    });
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'Space') {
+            isSpaceDown = false;
+            isPanning   = false;
+            document.body.classList.remove('space-down', 'panning');
+        }
+    });
+    viewport.addEventListener('mousedown', () => {
+        if (isSpaceDown) { isPanning = true; document.body.classList.add('panning'); }
+    });
+    window.addEventListener('mousemove', (e) => {
+        if (isPanning) { camera.x += e.movementX; camera.y += e.movementY; updateBoard(); }
+    });
+    window.addEventListener('mouseup', () => {
+        isPanning = false;
+        document.body.classList.remove('panning');
+    });
+})();
+
+// ── File ingestion ────────────────────────────────────────────────────────────
+document.getElementById('fileInput').onchange = (e) =>
+    handleFiles(e.target.files).catch(console.error);
+
+const viewport = document.getElementById('viewport');
+viewport.ondragover  = (e) => { e.preventDefault(); viewport.classList.add('drag-active'); };
+viewport.ondragleave = (e) => { e.preventDefault(); viewport.classList.remove('drag-active'); };
+viewport.ondrop      = (e) => {
+    e.preventDefault();
+    viewport.classList.remove('drag-active');
+    handleFiles(e.dataTransfer.files).catch(console.error);
+};
+
+async function handleFiles(files) {
+    for (const file of files) {
+        if (!file.name.match(/\.(tif|tiff|png|jpg|jpeg)$/i)) continue;
+        if (isDuplicateFile(file, appState.images)) {
+            console.info(`Skipping duplicate: ${file.name}`);
+            continue;
+        }
+        await addImage(file);
+    }
+}
+
+async function addImage(file) {
+    const imgId = crypto.randomUUID();
+
+    // ── 1. Push a loading placeholder into reactive state immediately ───────
+    // Vue will render the spinner row right away.
+    const imgMeta = reactive({
+        id:      imgId,
+        name:    file.name,
+        fileSize: file.size,
+        loading: true,        // drives spinner in ImageRow
+        shape:   [1, 1],      // placeholder
+        axes:    { axisY: 0, axisX: 1 },
+        sliceIndices:   [],
+        nonDisplayDims: [],
+        labels:  [],
+    });
+    appState.images.push(imgMeta);
+    updateStatus();
+
+    // ── 2. Load file ────────────────────────────────────────────────────────
+    let loaded;
+    try {
+        loaded = await loadFileIntoArray(file);
+    } catch (err) {
+        console.error(err);
+        alert(`Failed to load ${file.name}: ${err.message}`);
+        appState.images.splice(appState.images.indexOf(imgMeta), 1);
+        updateStatus();
+        return;
+    }
+    const { intensityArray, rgba, w, h, shape } = loaded;
+    const imgShape = shape ?? [h, w];
+
+    // ── 3. Infer axes ────────────────────────────────────────────────────────
+    const axes = inferAxes(imgShape);
+    const nonDisplayDims = imgShape
+        .map((size, i) => ({ i, size }))
+        .filter(({ i }) => i !== axes.axisY && i !== axes.axisX);
+    const sliceIndices = nonDisplayDims.map(() => 0);
+
+    // ── 4. Build canvas tile (vanilla DOM — outside Vue) ────────────────────
+    const container  = document.createElement('div');
+    container.className  = 'image-container';
+    container.style.width  = w + 'px';
+    container.style.height = h + 'px';
+
+    const gpuCanvas   = document.createElement('canvas');
+    gpuCanvas.className = 'gpu-canvas';
+    gpuCanvas.width = w; gpuCanvas.height = h;
+
+    const labelCanvas = document.createElement('canvas');
+    labelCanvas.className = 'label-canvas';
+    labelCanvas.width = w; labelCanvas.height = h;
+
+    const tileLabel = document.createElement('div');
+    tileLabel.className   = 'image-tile-label';
+    tileLabel.textContent = file.name;
+
+    container.appendChild(gpuCanvas);
+    container.appendChild(labelCanvas);
+    container.appendChild(tileLabel);
+    document.getElementById('canvas-board').appendChild(container);
+
+    // ── 5. Init WebGPU ───────────────────────────────────────────────────────
+    const backend = new WebGpuBackend();
+    try {
+        await backend.initialize(gpuCanvas);
+    } catch (err) {
+        console.error(err);
+        alert('WebGPU not supported or initialization failed.');
+        container.remove();
+        appState.images.splice(appState.images.indexOf(imgMeta), 1);
+        updateStatus();
+        return;
+    }
+    await backend.allocateImage(w, h, rgba);
+    await backend.updateFeatures(intensityArray, appState.sigma);
+
+    // ── 6. Store resources (inert — Vue never sees this) ────────────────────
+    resourceMap.set(imgId, {
+        backend, gpuCanvas, labelCanvas, container, intensityArray,
+        _cachedRect: null,
+        _ro: null,
+    });
+
+    // ── 7. Finish reactive meta — one mutation, Vue re-renders once ─────────
+    imgMeta.shape          = imgShape;
+    imgMeta.axes           = axes;
+    imgMeta.nonDisplayDims = nonDisplayDims;
+    imgMeta.sliceIndices   = sliceIndices;
+    imgMeta.loading        = false;
+
+    // ── 8. Wire drawing events onto the canvas ───────────────────────────────
+    labelCanvas.addEventListener('mousedown', (e) => {
+        if (isSpaceDown) return;
+        resourceMap.get(imgId)._cachedRect = labelCanvas.getBoundingClientRect();
+        isDrawing   = true;
+        activeImgId = imgId;
+        paint(e, imgMeta);
+    });
+    labelCanvas.addEventListener('mousemove', (e) => {
+        if (isDrawing && activeImgId === imgId && !isSpaceDown) paint(e, imgMeta);
+    });
+    labelCanvas.addEventListener('mouseup', () => {
+        if (activeImgId === imgId) {
+            isDrawing   = false;
+            activeImgId = null;
+            if (appState.liveUpdate) scheduleTrainAndPredictAll();
+        }
+    });
+
+    const ro = new ResizeObserver(() => {
+        const res = resourceMap.get(imgId);
+        if (res) res._cachedRect = null;
+    });
+    ro.observe(labelCanvas);
+    resourceMap.get(imgId)._ro = ro;
+
+    updateStatus();
+}
+
+// ── Ingest event handlers (called by Vue component emits) ─────────────────────
+
+function handleReorder(imgId, direction) {
+    const idx    = appState.images.findIndex(i => i.id === imgId);
+    const newIdx = idx + direction;
+    if (idx === -1 || newIdx < 0 || newIdx >= appState.images.length) return;
+
+    // Swap reactive meta array (Vue re-renders ImageList)
+    const tmp = appState.images[idx];
+    appState.images[idx]    = appState.images[newIdx];
+    appState.images[newIdx] = tmp;
+
+    // Mirror swap on canvas board
+    const board = document.getElementById('canvas-board');
+    const tiles = [...board.children];
+    if (direction === -1) board.insertBefore(tiles[idx], tiles[newIdx]);
+    else                  board.insertBefore(tiles[newIdx], tiles[idx]);
+}
+
+function handleDelete(imgId) {
+    const idx = appState.images.findIndex(i => i.id === imgId);
+    if (idx === -1) return;
+
+    const meta       = appState.images[idx];
+    const labelCount = meta.labels.length;
+
+    if (labelCount > 0) {
+        const ok = confirm(
+            `"${meta.name}" has ${labelCount} label${labelCount !== 1 ? 's' : ''}.\n` +
+            `Deleting it will remove those labels and retrain the model. Continue?`
+        );
+        if (!ok) return;
     }
 
-    // ── Training ──────────────────────────────────────────────────────────────
-    async function trainAndPredictAll() {
-        const totalLabels = state.images.reduce((s, i) => s + i.labels.length, 0);
-        if (totalLabels < MIN_LABELS_TO_TRAIN) return;
+    // Tear down resources
+    const res = resourceMap.get(imgId);
+    if (res) {
+        res._ro?.disconnect();
+        res.container.remove();
+        resourceMap.delete(imgId);
+    }
 
-        const { combinedX, yArray } = await buildTrainingDataset(state.images, totalLabels);
-        state.rf.train(combinedX, yArray, RF_CONFIG.numTrees);
+    // Remove from reactive array — Vue handles the rest
+    appState.images.splice(idx, 1);
 
-        for (const img of state.images) {
-            await img.backend.runInference(state.rf);
+    if (labelCount > 0 && appState.liveUpdate) scheduleTrainAndPredictAll();
+    updateStatus();
+}
+
+// ── Axis / slice handlers (called by Vue component emits via ImageRow) ────────
+
+function handleAxisChange(imgId, role, axisIdx) {
+    const meta = appState.images.find(i => i.id === imgId);
+    if (!meta) return;
+
+    if (role === 'Y') meta.axes.axisY = axisIdx;
+    else              meta.axes.axisX = axisIdx;
+
+    // Recompute non-display dims and reset slice indices
+    meta.nonDisplayDims = meta.shape
+        .map((size, i) => ({ i, size }))
+        .filter(({ i }) => i !== meta.axes.axisY && i !== meta.axes.axisX);
+    meta.sliceIndices = meta.nonDisplayDims.map(() => 0);
+
+    rerenderSlice(imgId);
+}
+
+function handleSliceChange(imgId, arrIdx, value) {
+    const meta = appState.images.find(i => i.id === imgId);
+    if (!meta) return;
+    meta.sliceIndices[arrIdx] = value;
+    rerenderSlice(imgId);
+}
+
+async function rerenderSlice(imgId) {
+    const meta = appState.images.find(i => i.id === imgId);
+    const res  = resourceMap.get(imgId);
+    if (!meta || !res || meta.shape.length <= 2) return;
+
+    const slice = pickSlice(
+        res.intensityArray, meta.shape, meta.axes, meta.sliceIndices
+    );
+
+    // Greyscale normalise → RGBA
+    const n = slice.length;
+    const rgba = new Uint8ClampedArray(n * 4);
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < n; i++) {
+        if (slice[i] < min) min = slice[i];
+        if (slice[i] > max) max = slice[i];
+    }
+    const range = max - min || 1;
+    for (let i = 0; i < n; i++) {
+        const v = ((slice[i] - min) / range * 255) | 0;
+        rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = v;
+        rgba[i*4+3] = 255;
+    }
+
+    await res.backend.allocateImage(meta.shape[meta.axes.axisY], meta.shape[meta.axes.axisX], rgba);
+    await res.backend.updateFeatures(slice, appState.sigma);
+    if (appState.liveUpdate) scheduleTrainAndPredictAll();
+}
+
+// ── Sigma change ──────────────────────────────────────────────────────────────
+async function handleSigmaChange(sigma) {
+    for (const meta of appState.images) {
+        const res = resourceMap.get(meta.id);
+        if (res) await res.backend.updateFeatures(res.intensityArray, sigma);
+    }
+    if (appState.liveUpdate) scheduleTrainAndPredictAll();
+}
+
+// ── Painting ──────────────────────────────────────────────────────────────────
+function paint(e, imgMeta) {
+    const res  = resourceMap.get(imgMeta.id);
+    if (!res) return;
+    const rect   = res._cachedRect || res.labelCanvas.getBoundingClientRect();
+    const scaleX = imgMeta.shape[imgMeta.axes.axisX] / rect.width;
+    const scaleY = imgMeta.shape[imgMeta.axes.axisY] / rect.height;
+    const x      = Math.floor((e.clientX - rect.left) * scaleX);
+    const y      = Math.floor((e.clientY - rect.top)  * scaleY);
+    const radius = parseInt(document.getElementById('brushSize').value, 10);
+    const ctx    = res.labelCanvas.getContext('2d');
+    const w      = imgMeta.shape[imgMeta.axes.axisX];
+    const h      = imgMeta.shape[imgMeta.axes.axisY];
+
+    if (appState.isEraser) {
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+        ctx.globalCompositeOperation = 'source-over';
+        imgMeta.labels = eraseLabelsInRadius(imgMeta.labels, x, y, radius);
+    } else {
+        const last  = imgMeta.labels[imgMeta.labels.length - 1];
+        const isDup = last && last.x === x && last.y === y && last.cls === appState.currentClass;
+        if (!isDup && x >= 0 && x < w && y >= 0 && y < h) {
+            ctx.fillStyle = LABEL_COLORS[appState.currentClass] ?? LABEL_COLORS[0];
+            ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+            imgMeta.labels.push({ x, y, cls: appState.currentClass });
         }
     }
+    // imgMeta.labels is reactive — ImageRow badge re-renders automatically
+}
 
-    // ── UI state sync helpers ─────────────────────────────────────────────────
-    function updateStatus() {
-        const n = state.images.length;
-        document.getElementById('status').innerText =
-            n === 0 ? 'No images loaded. Drag & drop onto the canvas.'
-                    : `${n} image${n !== 1 ? 's' : ''} loaded.`;
+// ── Training ──────────────────────────────────────────────────────────────────
+async function trainAndPredictAll() {
+    const totalLabels = appState.images.reduce((s, i) => s + i.labels.length, 0);
+    if (totalLabels < MIN_LABELS_TO_TRAIN) return;
+
+    // Build training dataset using imgMeta (labels) + resources (intensityArray via backend)
+    const { combinedX, yArray } = await buildTrainingDataset(appState.images, resourceMap, totalLabels);
+    rf.train(combinedX, yArray, RF_CONFIG.numTrees);
+
+    for (const meta of appState.images) {
+        const res = resourceMap.get(meta.id);
+        if (res) await res.backend.runInference(rf);
     }
+}
 
-    function updateTrainButton() {
-        document.getElementById('btnTrain').disabled = state.images.length === 0;
-    }
-
-    function updateExportButtonCount() {
-        const btn = document.getElementById('btnExportAll');
-        const n   = state.images.length;
-        btn.disabled  = n === 0;
-        btn.innerText = n > 0 ? `Export Loaded Images (${n})` : 'Export Loaded Images';
-    }
-
-    function refreshEmptyState() {
-        document.getElementById('img-empty').style.display =
-            state.images.length === 0 ? '' : 'none';
-    }
-
-    init();
+// ── Status bar ────────────────────────────────────────────────────────────────
+function updateStatus() {
+    const n = appState.images.length;
+    document.getElementById('status').innerText =
+        n === 0 ? 'No images loaded. Drag & drop onto the canvas.'
+                : `${n} image${n !== 1 ? 's' : ''} loaded.`;
+}
 </script>
 </body>
 </html>
