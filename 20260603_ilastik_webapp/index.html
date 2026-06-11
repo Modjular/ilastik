@@ -6,9 +6,6 @@
     <title>Web Ilastik</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎨</text></svg>">
 
-    <!-- Vue 3 — sidebar only, no build step -->
-    <script src="https://unpkg.com/vue@3/dist/vue.esm-browser.js" type="importmap-shim"></script>
-
     <style>
         /* ── Reset / Base ────────────────────────────────────────────────── */
         *, *::before, *::after { box-sizing: border-box; }
@@ -232,48 +229,32 @@
 </div>
 
 <script type="module">
-import {
-    createApp, reactive, computed, ref,
-} from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js';
+import { createApp, reactive } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js';
 
 import { FlatRandomForest }  from './rf.js';
-import { WebGpuBackend }     from './backends/webgpu.js';
+import { RF_CONFIG }         from './constants.js';
+import { PhasePanel }        from './components.js';
+import { setupCamera, isSpaceDown } from './camera.js';
+import { paint, handleSigmaChange } from './drawing.js';
+import { debounce, trainAndPredictAll } from './training.js';
 import {
-    loadFileIntoArray,
-    verifyPermission,
-    writeFile,
-    buildTrainingDataset,
-    eraseLabelsInRadius,
-    exportImagesData,
-    inferAxes,
-    pickSlice,
-    isDuplicateFile,
-} from './utils.js';
+    handleFiles,
+    handleReorder,
+    handleDelete,
+    handleAxisChange,
+    handleSliceChange,
+    handleExport,
+} from './events.js';
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const RF_CONFIG              = { numTrees: 8, maxDepth: 8 };
-const MIN_LABELS_TO_TRAIN    = 5;
-const CAMERA_ZOOM_MIN        = 0.1;
-const CAMERA_ZOOM_MAX        = 10;
-const CAMERA_ZOOM_SENSITIVITY = 0.01;
-const TRAIN_DEBOUNCE_MS      = 300;
-const LABEL_COLORS           = [
-    'rgba(255,0,0,0.5)',
-    'rgba(0,255,0,0.5)',
-    'rgba(0,0,255,0.5)',
-];
-
-// ── Resource map — GPU handles, canvas refs, raw arrays ──────────────────────
-// Never passed to Vue. Keyed by imgMeta.id.
-// Shape: { backend, gpuCanvas, labelCanvas, container, intensityArray,
-//          _cachedRect, _ro }
+// ── Shared singletons ─────────────────────────────────────────────────────────
+// resourceMap: GPU handles, canvas refs, raw arrays — never passed to Vue.
+// Shape: { backend, gpuCanvas, labelCanvas, container, intensityArray, _cachedRect, _ro }
 const resourceMap = new Map();
+const rf          = new FlatRandomForest(RF_CONFIG);
 
 // ── Reactive state — Vue owns this ───────────────────────────────────────────
-// imgMeta shape: { id, name, fileSize, shape, axes, sliceIndices,
-//                  nonDisplayDims, labels[] }
 const appState = reactive({
-    images:       [],       // array of imgMeta — Vue v-for source
+    images:       [],
     currentClass: 0,
     sigma:        1.0,
     isEraser:     false,
@@ -281,200 +262,58 @@ const appState = reactive({
     outputDirHandle: null,
     exportSeg:    true,
     exportProb:   false,
-    exportStatus: '',       // feedback string for Export panel
+    exportStatus: '',
     hasDirectoryPicker: ('showDirectoryPicker' in window),
     dirLabel:     'ZIP download (default)',
 });
 
-// Drawing / camera flags — change at 60 fps, Vue has no business watching them
-let isDrawing    = false;
-let activeImgId  = null;
-let isSpaceDown  = false;
-let isPanning    = false;
-const camera     = { x: 0, y: 0, scale: 1 };
-const rf         = new FlatRandomForest(RF_CONFIG);
+// ── Bound helpers (close over singletons, passed down as props/callbacks) ─────
+const _scheduleRetrain = () => debounce(() => trainAndPredictAll(appState, resourceMap, rf));
+const _trainFn         = () => trainAndPredictAll(appState, resourceMap, rf);
+const _paintFn         = (e, imgMeta) => paint(e, imgMeta, appState, resourceMap);
+const _isSpaceDownRef  = () => isSpaceDown;
 
-// ── Debounced train ───────────────────────────────────────────────────────────
-let _trainTimer = null;
-function scheduleTrainAndPredictAll() {
-    clearTimeout(_trainTimer);
-    _trainTimer = setTimeout(trainAndPredictAll, TRAIN_DEBOUNCE_MS);
+function updateStatus() {
+    const n = appState.images.length;
+    document.getElementById('status').innerText =
+        n === 0 ? 'No images loaded. Drag & drop onto the canvas.'
+                : `${n} image${n !== 1 ? 's' : ''} loaded.`;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Vue Components
-// ────────────────────────────────────────────────────────────────────────────
-
-// ── SliceSliders ─────────────────────────────────────────────────────────────
-// Props:  nonDisplayDims [{ i, size }], sliceIndices [number]
-// Emits:  slice-change { arrIdx, value }
-const SliceSliders = {
-    props: ['nonDisplayDims', 'sliceIndices'],
-    emits: ['slice-change'],
+// ── Mount Vue ─────────────────────────────────────────────────────────────────
+const app = createApp({
+    components: { PhasePanel },
+    setup() { return { appState }; },
     template: `
-        <div class="img-slice">
-            <div
-                v-for="(dim, arrIdx) in nonDisplayDims"
-                :key="dim.i"
-                class="img-slice-row"
-            >
-                <label>D{{ dim.i }}</label>
-                <input
-                    type="range" :min="0" :max="dim.size - 1"
-                    :value="sliceIndices[arrIdx]"
-                    @input="$emit('slice-change', { arrIdx, value: +$event.target.value })"
-                />
-                <span>{{ sliceIndices[arrIdx] }}/{{ dim.size - 1 }}</span>
-            </div>
-        </div>
-    `,
-};
-
-// ── AxisSelector ─────────────────────────────────────────────────────────────
-// Props:  shape [number], axes { axisY, axisX }
-// Emits:  axis-change { role: 'Y'|'X', axisIdx }
-const AxisSelector = {
-    props: ['shape', 'axes'],
-    emits: ['axis-change'],
-    computed: {
-        dimOptions() {
-            return this.shape.map((size, i) => ({ value: i, label: `Dim ${i} (${size})` }));
-        },
-    },
-    template: `
-        <div class="img-axes">
-            <div class="img-axes-row" v-for="role in ['Y','X']" :key="role">
-                <label>{{ role }}</label>
-                <select
-                    :value="role === 'Y' ? axes.axisY : axes.axisX"
-                    @change="$emit('axis-change', { role, axisIdx: +$event.target.value })"
-                >
-                    <option v-for="opt in dimOptions" :key="opt.value" :value="opt.value">
-                        {{ opt.label }}
-                    </option>
-                </select>
-            </div>
-        </div>
-    `,
-};
-
-// ── ImageRow ──────────────────────────────────────────────────────────────────
-// Props:  meta (imgMeta), isFirst, isLast
-// Emits:  reorder { direction: -1|1 }, delete
-const ImageRow = {
-    props: ['meta', 'isFirst', 'isLast'],
-    emits: ['reorder', 'delete'],
-    components: { AxisSelector, SliceSliders },
-    computed: {
-        labelText() {
-            const n = this.meta.labels.length;
-            return n === 0 ? 'no labels' : `${n} label${n !== 1 ? 's' : ''}`;
-        },
-        isMultiDim() {
-            return this.meta.shape.length > 2;
-        },
-    },
-    template: `
-        <div class="img-row" :class="{ loading: meta.loading }">
-            <div class="img-loading-bar" v-if="meta.loading"></div>
-            <div class="img-row-header">
-                <div class="img-reorder">
-                    <button :disabled="isFirst" @click="$emit('reorder', { direction: -1 })" title="Move up">▲</button>
-                    <button :disabled="isLast"  @click="$emit('reorder', { direction: +1 })" title="Move down">▼</button>
-                </div>
-                <div class="img-name" :title="meta.name">{{ meta.name }}</div>
-                <div class="img-label-badge" :class="{ 'has-labels': meta.labels.length > 0 }">
-                    {{ labelText }}
-                </div>
-                <button class="img-delete" :disabled="meta.loading"
-                        @click="$emit('delete')" title="Remove image">✕</button>
-            </div>
-            <template v-if="!meta.loading && isMultiDim">
-                <AxisSelector
-                    :shape="meta.shape"
-                    :axes="meta.axes"
-                    @axis-change="onAxisChange"
-                />
-                <SliceSliders
-                    :nonDisplayDims="meta.nonDisplayDims"
-                    :sliceIndices="meta.sliceIndices"
-                    @slice-change="onSliceChange"
-                />
-            </template>
-        </div>
+        <PhasePanel
+            :state="appState"
+            :onAxisChange="onAxisChange"
+            :onSliceChange="onSliceChange"
+            :onReorder="onReorder"
+            :onDelete="onDelete"
+            :onSigmaInput="onSigmaInput"
+            :onToggleEraser="onToggleEraser"
+            :onSelectClass="onSelectClass"
+            :onToggleLiveUpdate="onToggleLiveUpdate"
+            :onSetDir="onSetDir"
+            :onExport="onExport"
+        />
     `,
     methods: {
-        onAxisChange({ role, axisIdx }) {
-            handleAxisChange(this.meta.id, role, axisIdx);
-        },
-        onSliceChange({ arrIdx, value }) {
-            handleSliceChange(this.meta.id, arrIdx, value);
-        },
-    },
-};
-
-// ── ImageList ─────────────────────────────────────────────────────────────────
-// Props:  images []
-// Emits:  reorder { id, direction }, delete { id }
-const ImageList = {
-    props: ['images'],
-    emits: ['reorder', 'delete'],
-    components: { ImageRow },
-    template: `
-        <div class="img-list">
-            <div v-if="images.length === 0" class="img-empty">
-                Drop images onto the canvas<br>or use the file picker above.
-            </div>
-            <ImageRow
-                v-for="(meta, idx) in images"
-                :key="meta.id"
-                :meta="meta"
-                :isFirst="idx === 0"
-                :isLast="idx === images.length - 1"
-                @reorder="e => $emit('reorder', { id: meta.id, direction: e.direction })"
-                @delete="$emit('delete', { id: meta.id })"
-            />
-        </div>
-    `,
-};
-
-// ── PhasePanel ────────────────────────────────────────────────────────────────
-// Root sidebar component. Owns activePhase locally; receives appState as prop.
-const PhasePanel = {
-    props: ['state'],
-    components: { ImageList },
-    setup(props) {
-        const activePhase = ref('ingest');
-        const exportBusy  = ref(false);
-
-        // Computed helpers used in the template
-        const totalLabels = computed(() =>
-            props.state.images.reduce((s, i) => s + i.labels.length, 0)
-        );
-        const canExport = computed(() =>
-            props.state.images.length > 0 && !exportBusy.value
-        );
-        const exportCount = computed(() => props.state.images.length);
-
-        return { activePhase, exportBusy, totalLabels, canExport, exportCount };
-    },
-    methods: {
-        onReorder({ id, direction }) { handleReorder(id, direction); },
-        onDelete({ id })             { handleDelete(id); },
+        onAxisChange: (imgId, role, axisIdx) => handleAxisChange(imgId, role, axisIdx, appState, resourceMap, _scheduleRetrain),
+        onSliceChange: (imgId, arrIdx, value) => handleSliceChange(imgId, arrIdx, value, appState, resourceMap, _scheduleRetrain),
+        onReorder: (imgId, direction) => handleReorder(imgId, direction, appState),
+        onDelete:  (imgId) => handleDelete(imgId, appState, resourceMap, _scheduleRetrain, updateStatus),
 
         onSigmaInput(e) {
             appState.sigma = parseFloat(e.target.value);
-            handleSigmaChange(appState.sigma);
+            handleSigmaChange(appState.sigma, appState, resourceMap, _scheduleRetrain);
         },
-        onToggleEraser() {
-            appState.isEraser = !appState.isEraser;
-        },
-        onSelectClass(cls) {
-            appState.currentClass = cls;
-        },
-        onToggleLiveUpdate() {
+        onToggleEraser()      { appState.isEraser  = !appState.isEraser; },
+        onSelectClass(cls)    { appState.currentClass = cls; },
+        onToggleLiveUpdate()  {
             appState.liveUpdate = !appState.liveUpdate;
-            if (appState.liveUpdate) trainAndPredictAll();
+            if (appState.liveUpdate) _trainFn();
         },
 
         async onSetDir() {
@@ -484,234 +323,25 @@ const PhasePanel = {
             } catch (err) { console.warn(err); }
         },
 
-        async onExport() {
-            if (!appState.exportSeg && !appState.exportProb) {
-                alert('Select at least one export option.');
-                return;
-            }
-            if (this.totalLabels < MIN_LABELS_TO_TRAIN) {
-                alert(`Paint at least ${MIN_LABELS_TO_TRAIN} labels before exporting.`);
-                return;
-            }
-            this.exportBusy = true;
-            appState.exportStatus = 'Training…';
-            try {
-                await trainAndPredictAll();
-                appState.exportStatus = 'Exporting…';
-                await exportImagesData(appState.images, rf, {
-                    exportSeg:  appState.exportSeg,
-                    exportProb: appState.exportProb,
-                    outputDirHandle: appState.outputDirHandle,
-                    verifyPermission,
-                    writeFile,
-                    resourceMap,
-                });
-                alert('All images exported successfully!');
-            } catch (err) {
-                console.error(err);
-                alert(`Export failed: ${err.message}`);
-            } finally {
-                this.exportBusy = false;
-                appState.exportStatus = '';
-            }
+        async onExport(exportBusyRef, totalLabels) {
+            await handleExport(appState, resourceMap, rf, _trainFn, {
+                exportBusyRef,
+                setExportBusy: (v) => { exportBusyRef.value = v; },
+                totalLabels: totalLabels.value,
+            });
         },
     },
-
-    template: `
-        <div class="phase-tabs">
-            <button
-                v-for="phase in ['ingest','train','export']"
-                :key="phase"
-                class="phase-tab"
-                :class="{ active: activePhase === phase }"
-                @click="activePhase = phase"
-            >{{ { ingest: 'Images', train: 'Train', export: 'Export' }[phase] }}</button>
-        </div>
-
-        <!-- ── Images ──────────────────────────────────────────────── -->
-        <div v-show="activePhase === 'ingest'" class="phase-panel">
-            <ImageList
-                :images="state.images"
-                @reorder="onReorder"
-                @delete="onDelete"
-            />
-            <p class="hint">
-                Drag files onto the canvas to load them.<br>
-                Use ▲▼ to reorder. Delete removes labels &amp; retrains.
-            </p>
-        </div>
-
-        <!-- ── Train ───────────────────────────────────────────────── -->
-        <div v-show="activePhase === 'train'" class="phase-panel">
-            <div class="control-group">
-                <span class="control-label">Feature Scale (Sigma)</span>
-                <div style="display:flex; gap:10px; align-items:center;">
-                    <input type="range" min="0.3" max="10.0" step="0.1"
-                           :value="state.sigma" @input="onSigmaInput" style="flex:1;">
-                    <span style="min-width:30px; font-size:12px;">{{ state.sigma.toFixed(1) }}</span>
-                </div>
-            </div>
-
-            <div class="control-group">
-                <span class="control-label">Brush Size &amp; Eraser</span>
-                <div style="display:flex; gap:10px; align-items:center;">
-                    <input type="number" id="brushSize" value="5"
-                           min="1" max="50" step="1" style="width:60px;">
-                    <button
-                        :class="state.isEraser ? 'btn-danger' : 'btn-subtle'"
-                        style="flex:1;"
-                        @click="onToggleEraser"
-                    >Eraser: {{ state.isEraser ? 'ON' : 'OFF' }}</button>
-                </div>
-            </div>
-
-            <div class="control-group">
-                <span class="control-label">Classes</span>
-                <div class="class-selector">
-                    <div
-                        v-for="(cls, idx) in [
-                            { label: 'Class 1', color: 'red'   },
-                            { label: 'Class 2', color: 'green' },
-                            { label: 'Class 3', color: 'blue'  },
-                        ]"
-                        :key="idx"
-                        class="class-item"
-                        :class="{ active: state.currentClass === idx }"
-                        @click="onSelectClass(idx)"
-                    >
-                        <div class="color-box" :style="{ background: cls.color }"></div>
-                        <span>{{ cls.label }}</span>
-                    </div>
-                </div>
-            </div>
-
-            <hr class="divider">
-
-            <button
-                :disabled="state.images.length === 0"
-                :style="{ background: state.liveUpdate ? '#4CAF50' : '' }"
-                @click="onToggleLiveUpdate"
-            >Live Update: {{ state.liveUpdate ? 'ON' : 'OFF' }}</button>
-
-            <p class="hint">
-                Paint labels on the canvas, then enable Live Update
-                to see segmentation results in real time.
-            </p>
-        </div>
-
-        <!-- ── Export ──────────────────────────────────────────────── -->
-        <div v-show="activePhase === 'export'" class="phase-panel">
-            <div class="control-group">
-                <span class="control-label">Export</span>
-                <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-                    <input type="checkbox" v-model="state.exportSeg"> Segmentations
-                </label>
-                <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
-                    <input type="checkbox" v-model="state.exportProb"> Probabilities
-                </label>
-            </div>
-
-            <hr class="divider">
-
-            <div class="control-group">
-                <span class="control-label">Destination</span>
-                <div style="font-size:11px; color:#888; word-break:break-all;">
-                    {{ state.dirLabel }}
-                </div>
-                <button v-if="state.hasDirectoryPicker"
-                        class="btn-subtle" @click="onSetDir">
-                    Set Output Folder…
-                </button>
-            </div>
-
-            <button class="btn-success" :disabled="!canExport" @click="onExport">
-                <template v-if="exportBusy">{{ state.exportStatus }}</template>
-                <template v-else>
-                    Export Loaded Images{{ exportCount > 0 ? \` (\${exportCount})\` : '' }}
-                </template>
-            </button>
-
-            <p class="hint">At least {{ $options.MIN_LABELS_TO_TRAIN }} labels needed to train before export.</p>
-        </div>
-    `,
-    // expose constant to template
-    MIN_LABELS_TO_TRAIN,
-};
-
-// ── Mount Vue on #sidebar ─────────────────────────────────────────────────────
-const app = createApp({
-    components: { PhasePanel },
-    setup() { return { appState }; },
-    template: `<PhasePanel :state="appState" />`,
 });
 app.mount('#sidebar');
 
-// ────────────────────────────────────────────────────────────────────────────
-// Vanilla JS — camera, canvas, drawing, training
-// (Nothing below knows Vue exists)
-// ────────────────────────────────────────────────────────────────────────────
-
-// ── Camera ───────────────────────────────────────────────────────────────────
-(function setupCamera() {
-    const viewport = document.getElementById('viewport');
-    const board    = document.getElementById('canvas-board');
-
-    function updateBoard() {
-        board.style.transform =
-            `translate(${camera.x}px, ${camera.y}px) scale(${camera.scale})`;
-    }
-
-    viewport.addEventListener('wheel', (e) => {
-        e.preventDefault();
-        if (e.ctrlKey || e.metaKey) {
-            const delta    = -e.deltaY * CAMERA_ZOOM_SENSITIVITY;
-            const newScale = Math.min(
-                Math.max(CAMERA_ZOOM_MIN, camera.scale * Math.exp(delta)),
-                CAMERA_ZOOM_MAX
-            );
-            const rect   = viewport.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-            const boardX = (mouseX - camera.x) / camera.scale;
-            const boardY = (mouseY - camera.y) / camera.scale;
-            camera.scale = newScale;
-            camera.x = mouseX - boardX * camera.scale;
-            camera.y = mouseY - boardY * camera.scale;
-        } else {
-            camera.x -= e.deltaX;
-            camera.y -= e.deltaY;
-        }
-        updateBoard();
-    }, { passive: false });
-
-    window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && !isSpaceDown) {
-            isSpaceDown = true;
-            document.body.classList.add('space-down');
-        }
-    });
-    window.addEventListener('keyup', (e) => {
-        if (e.code === 'Space') {
-            isSpaceDown = false;
-            isPanning   = false;
-            document.body.classList.remove('space-down', 'panning');
-        }
-    });
-    viewport.addEventListener('mousedown', () => {
-        if (isSpaceDown) { isPanning = true; document.body.classList.add('panning'); }
-    });
-    window.addEventListener('mousemove', (e) => {
-        if (isPanning) { camera.x += e.movementX; camera.y += e.movementY; updateBoard(); }
-    });
-    window.addEventListener('mouseup', () => {
-        isPanning = false;
-        document.body.classList.remove('panning');
-    });
-})();
+// ── Camera ────────────────────────────────────────────────────────────────────
+setupCamera();
 
 // ── File ingestion ────────────────────────────────────────────────────────────
+const deps = { isSpaceDownRef: _isSpaceDownRef, paint: _paintFn, scheduleRetrain: _scheduleRetrain, updateStatus };
+
 document.getElementById('fileInput').onchange = (e) =>
-    handleFiles(e.target.files).catch(console.error);
+    handleFiles(e.target.files, appState, resourceMap, deps).catch(console.error);
 
 const viewport = document.getElementById('viewport');
 viewport.ondragover  = (e) => { e.preventDefault(); viewport.classList.add('drag-active'); };
@@ -719,391 +349,8 @@ viewport.ondragleave = (e) => { e.preventDefault(); viewport.classList.remove('d
 viewport.ondrop      = (e) => {
     e.preventDefault();
     viewport.classList.remove('drag-active');
-    handleFiles(e.dataTransfer.files).catch(console.error);
+    handleFiles(e.dataTransfer.files, appState, resourceMap, deps).catch(console.error);
 };
-
-async function handleFiles(files) {
-    for (const file of files) {
-        if (!file.name.match(/\.(tif|tiff|png|jpg|jpeg)$/i)) continue;
-        if (isDuplicateFile(file, appState.images)) {
-            console.info(`Skipping duplicate: ${file.name}`);
-            continue;
-        }
-        await addImage(file);
-    }
-}
-
-async function addImage(file) {
-    const imgId = crypto.randomUUID();
-
-    // ── 1. Push a loading placeholder into reactive state immediately ───────
-    // Vue will render the spinner row right away.
-    const imgMeta = reactive({
-        id:      imgId,
-        name:    file.name,
-        fileSize: file.size,
-        loading: true,        // drives spinner in ImageRow
-        shape:   [1, 1],      // placeholder
-        axes:    { axisY: 0, axisX: 1 },
-        sliceIndices:   [],
-        nonDisplayDims: [],
-        labels:  [],
-    });
-    appState.images.push(imgMeta);
-    updateStatus();
-
-    // ── 2. Load file ────────────────────────────────────────────────────────
-    let loaded;
-    try {
-        loaded = await loadFileIntoArray(file);
-    } catch (err) {
-        console.error(err);
-        alert(`Failed to load ${file.name}: ${err.message}`);
-        appState.images.splice(appState.images.indexOf(imgMeta), 1);
-        updateStatus();
-        return;
-    }
-    const { intensityArray, rgba, w, h, shape } = loaded;
-    const imgShape = shape ?? [h, w];
-
-    // ── 3. Infer axes ────────────────────────────────────────────────────────
-    const axes = inferAxes(imgShape);
-    const nonDisplayDims = imgShape
-        .map((size, i) => ({ i, size }))
-        .filter(({ i }) => i !== axes.axisY && i !== axes.axisX);
-    const sliceIndices = nonDisplayDims.map(() => 0);
-
-    // ── 4. Build canvas tile (vanilla DOM — outside Vue) ────────────────────
-    const container  = document.createElement('div');
-    container.className  = 'image-container';
-    container.style.width  = w + 'px';
-    container.style.height = h + 'px';
-
-    const gpuCanvas   = document.createElement('canvas');
-    gpuCanvas.className = 'gpu-canvas';
-    gpuCanvas.width = w; gpuCanvas.height = h;
-
-    const labelCanvas = document.createElement('canvas');
-    labelCanvas.className = 'label-canvas';
-    labelCanvas.width = w; labelCanvas.height = h;
-
-    const tileLabel = document.createElement('div');
-    tileLabel.className   = 'image-tile-label';
-    tileLabel.textContent = file.name;
-
-    container.appendChild(gpuCanvas);
-    container.appendChild(labelCanvas);
-    container.appendChild(tileLabel);
-    document.getElementById('canvas-board').appendChild(container);
-
-    // ── 5. Init WebGPU ───────────────────────────────────────────────────────
-    const backend = new WebGpuBackend();
-    try {
-        await backend.initialize(gpuCanvas);
-    } catch (err) {
-        console.error(err);
-        alert('WebGPU not supported or initialization failed.');
-        container.remove();
-        appState.images.splice(appState.images.indexOf(imgMeta), 1);
-        updateStatus();
-        return;
-    }
-    await backend.allocateImage(w, h, rgba);
-    await backend.updateFeatures(intensityArray, appState.sigma);
-
-    // ── 6. Store resources (inert — Vue never sees this) ────────────────────
-    resourceMap.set(imgId, {
-        backend, gpuCanvas, labelCanvas, container, intensityArray,
-        _cachedRect: null,
-        _ro: null,
-    });
-
-    // ── 7. Finish reactive meta — one mutation, Vue re-renders once ─────────
-    imgMeta.shape          = imgShape;
-    imgMeta.axes           = axes;
-    imgMeta.nonDisplayDims = nonDisplayDims;
-    imgMeta.sliceIndices   = sliceIndices;
-    imgMeta.loading        = false;
-
-    // ── 8. Wire drawing events onto the canvas ───────────────────────────────
-    labelCanvas.addEventListener('mousedown', (e) => {
-        if (isSpaceDown) return;
-        resourceMap.get(imgId)._cachedRect = labelCanvas.getBoundingClientRect();
-        isDrawing   = true;
-        activeImgId = imgId;
-        paint(e, imgMeta);
-    });
-    labelCanvas.addEventListener('mousemove', (e) => {
-        if (isDrawing && activeImgId === imgId && !isSpaceDown) {
-            if (e.buttons !== 1) {
-                isDrawing   = false;
-                activeImgId = null;
-                if (appState.liveUpdate) scheduleTrainAndPredictAll();
-            } else {
-                paint(e, imgMeta);
-            }
-        }
-    });
-    labelCanvas.addEventListener('mouseup', () => {
-        if (activeImgId === imgId) {
-            isDrawing   = false;
-            activeImgId = null;
-            if (appState.liveUpdate) scheduleTrainAndPredictAll();
-        }
-    });
-
-    const ro = new ResizeObserver(() => {
-        const res = resourceMap.get(imgId);
-        if (res) res._cachedRect = null;
-    });
-    ro.observe(labelCanvas);
-    resourceMap.get(imgId)._ro = ro;
-
-    updateStatus();
-}
-
-// ── Ingest event handlers (called by Vue component emits) ─────────────────────
-
-function handleReorder(imgId, direction) {
-    const idx    = appState.images.findIndex(i => i.id === imgId);
-    const newIdx = idx + direction;
-    if (idx === -1 || newIdx < 0 || newIdx >= appState.images.length) return;
-
-    // Swap reactive meta array (Vue re-renders ImageList)
-    const tmp = appState.images[idx];
-    appState.images[idx]    = appState.images[newIdx];
-    appState.images[newIdx] = tmp;
-
-    // Mirror swap on canvas board
-    const board = document.getElementById('canvas-board');
-    const tiles = [...board.children];
-    if (direction === -1) board.insertBefore(tiles[idx], tiles[newIdx]);
-    else                  board.insertBefore(tiles[newIdx], tiles[idx]);
-}
-
-function handleDelete(imgId) {
-    const idx = appState.images.findIndex(i => i.id === imgId);
-    if (idx === -1) return;
-
-    const meta       = appState.images[idx];
-    const labelCount = meta.labels.length;
-
-    if (labelCount > 0) {
-        const ok = confirm(
-            `"${meta.name}" has ${labelCount} label${labelCount !== 1 ? 's' : ''}.\n` +
-            `Deleting it will remove those labels and retrain the model. Continue?`
-        );
-        if (!ok) return;
-    }
-
-    // Tear down resources
-    const res = resourceMap.get(imgId);
-    if (res) {
-        res._ro?.disconnect();
-        res.container.remove();
-        resourceMap.delete(imgId);
-    }
-
-    // Remove from reactive array — Vue handles the rest
-    appState.images.splice(idx, 1);
-
-    if (labelCount > 0 && appState.liveUpdate) scheduleTrainAndPredictAll();
-    updateStatus();
-}
-
-// ── Axis / slice handlers (called by Vue component emits via ImageRow) ────────
-
-function handleAxisChange(imgId, role, axisIdx) {
-    const meta = appState.images.find(i => i.id === imgId);
-    if (!meta) return;
-
-    if (role === 'Y') meta.axes.axisY = axisIdx;
-    else              meta.axes.axisX = axisIdx;
-
-    // Recompute non-display dims and reset slice indices
-    meta.nonDisplayDims = meta.shape
-        .map((size, i) => ({ i, size }))
-        .filter(({ i }) => i !== meta.axes.axisY && i !== meta.axes.axisX);
-    meta.sliceIndices = meta.nonDisplayDims.map(() => 0);
-
-    rerenderSlice(imgId);
-}
-
-function handleSliceChange(imgId, arrIdx, value) {
-    const meta = appState.images.find(i => i.id === imgId);
-    if (!meta) return;
-    meta.sliceIndices[arrIdx] = value;
-    rerenderSlice(imgId);
-}
-
-async function rerenderSlice(imgId) {
-    const meta = appState.images.find(i => i.id === imgId);
-    const res  = resourceMap.get(imgId);
-    if (!meta || !res) return;
-
-    const w = meta.shape[meta.axes.axisX];
-    const h = meta.shape[meta.axes.axisY];
-
-    // Update container and canvas dimensions if needed
-    if (res.container.style.width !== w + 'px') res.container.style.width = w + 'px';
-    if (res.container.style.height !== h + 'px') res.container.style.height = h + 'px';
-    if (res.gpuCanvas.width !== w) res.gpuCanvas.width = w;
-    if (res.gpuCanvas.height !== h) res.gpuCanvas.height = h;
-    if (res.labelCanvas.width !== w) res.labelCanvas.width = w;
-    if (res.labelCanvas.height !== h) res.labelCanvas.height = h;
-
-    if (meta.shape.length <= 2) {
-        redrawLabels(imgId);
-        return;
-    }
-
-    const slice = pickSlice(
-        res.intensityArray, meta.shape, meta.axes, meta.sliceIndices
-    );
-
-    // Greyscale normalise → RGBA
-    const n = slice.length;
-    const rgba = new Uint8ClampedArray(n * 4);
-    let min = Infinity, max = -Infinity;
-    for (let i = 0; i < n; i++) {
-        if (slice[i] < min) min = slice[i];
-        if (slice[i] > max) max = slice[i];
-    }
-    const range = max - min || 1;
-    for (let i = 0; i < n; i++) {
-        const v = ((slice[i] - min) / range * 255) | 0;
-        rgba[i*4] = rgba[i*4+1] = rgba[i*4+2] = v;
-        rgba[i*4+3] = 255;
-    }
-
-    await res.backend.allocateImage(w, h, rgba);
-    await res.backend.updateFeatures(slice, appState.sigma);
-    
-    redrawLabels(imgId);
-
-    if (appState.liveUpdate) scheduleTrainAndPredictAll();
-}
-
-function isLabelVisible(label, meta) {
-    let sliceIdx = 0;
-    for (let d = 0; d < meta.shape.length; d++) {
-        if (d !== meta.axes.axisY && d !== meta.axes.axisX) {
-            if (label.coords[d] !== meta.sliceIndices[sliceIdx++]) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-function redrawLabels(imgId) {
-    const meta = appState.images.find(i => i.id === imgId);
-    const res  = resourceMap.get(imgId);
-    if (!meta || !res) return;
-
-    const ctx = res.labelCanvas.getContext('2d');
-    ctx.clearRect(0, 0, res.labelCanvas.width, res.labelCanvas.height);
-
-    for (const l of meta.labels) {
-        if (isLabelVisible(l, meta)) {
-            const x = l.coords[meta.axes.axisX];
-            const y = l.coords[meta.axes.axisY];
-            ctx.fillStyle = LABEL_COLORS[l.cls] ?? LABEL_COLORS[0];
-            ctx.beginPath();
-            ctx.arc(x, y, l.radius, 0, Math.PI * 2);
-            ctx.fill();
-        }
-    }
-}
-
-// ── Sigma change ──────────────────────────────────────────────────────────────
-async function handleSigmaChange(sigma) {
-    for (const meta of appState.images) {
-        const res = resourceMap.get(meta.id);
-        if (res) {
-            if (meta.shape.length <= 2) {
-                await res.backend.updateFeatures(res.intensityArray, sigma);
-            } else {
-                const slice = pickSlice(
-                    res.intensityArray, meta.shape, meta.axes, meta.sliceIndices
-                );
-                await res.backend.updateFeatures(slice, sigma);
-            }
-        }
-    }
-    if (appState.liveUpdate) scheduleTrainAndPredictAll();
-}
-
-// ── Painting ──────────────────────────────────────────────────────────────────
-function paint(e, imgMeta) {
-    const res  = resourceMap.get(imgMeta.id);
-    if (!res) return;
-    const rect   = res._cachedRect || res.labelCanvas.getBoundingClientRect();
-    const scaleX = imgMeta.shape[imgMeta.axes.axisX] / rect.width;
-    const scaleY = imgMeta.shape[imgMeta.axes.axisY] / rect.height;
-    const x      = Math.floor((e.clientX - rect.left) * scaleX);
-    const y      = Math.floor((e.clientY - rect.top)  * scaleY);
-    const radius = parseInt(document.getElementById('brushSize').value, 10);
-    const ctx    = res.labelCanvas.getContext('2d');
-    const w      = imgMeta.shape[imgMeta.axes.axisX];
-    const h      = imgMeta.shape[imgMeta.axes.axisY];
-
-    if (appState.isEraser) {
-        imgMeta.labels = eraseLabelsInRadius(imgMeta.labels, x, y, radius, imgMeta.axes, imgMeta);
-        redrawLabels(imgMeta.id);
-    } else {
-        const coords = new Array(imgMeta.shape.length);
-        coords[imgMeta.axes.axisY] = y;
-        coords[imgMeta.axes.axisX] = x;
-        let sliceIdx = 0;
-        for (let d = 0; d < imgMeta.shape.length; d++) {
-            if (d !== imgMeta.axes.axisY && d !== imgMeta.axes.axisX) {
-                coords[d] = imgMeta.sliceIndices[sliceIdx++];
-            }
-        }
-
-        const last = imgMeta.labels[imgMeta.labels.length - 1];
-        let isDup = false;
-        if (last && last.cls === appState.currentClass) {
-            isDup = true;
-            for (let d = 0; d < imgMeta.shape.length; d++) {
-                if (last.coords[d] !== coords[d]) {
-                    isDup = false;
-                    break;
-                }
-            }
-        }
-
-        if (!isDup && x >= 0 && x < w && y >= 0 && y < h) {
-            ctx.fillStyle = LABEL_COLORS[appState.currentClass] ?? LABEL_COLORS[0];
-            ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
-            imgMeta.labels.push({ coords, cls: appState.currentClass, radius });
-        }
-    }
-}
-
-// ── Training ──────────────────────────────────────────────────────────────────
-async function trainAndPredictAll() {
-    const totalLabels = appState.images.reduce((s, i) => s + i.labels.length, 0);
-    if (totalLabels < MIN_LABELS_TO_TRAIN) return;
-
-    // Build training dataset using imgMeta (labels) + resources (intensityArray via backend)
-    const { combinedX, yArray } = await buildTrainingDataset(appState.images, resourceMap, totalLabels, appState.sigma);
-    rf.train(combinedX, yArray, 8);
-
-    for (const meta of appState.images) {
-        const res = resourceMap.get(meta.id);
-        if (res) await res.backend.runInference(rf);
-    }
-}
-
-// ── Status bar ────────────────────────────────────────────────────────────────
-function updateStatus() {
-    const n = appState.images.length;
-    document.getElementById('status').innerText =
-        n === 0 ? 'No images loaded. Drag & drop onto the canvas.'
-                : `${n} image${n !== 1 ? 's' : ''} loaded.`;
-}
 </script>
 </body>
 </html>
