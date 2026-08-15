@@ -47,6 +47,14 @@ PLAN.md phase 7).
 
 ```
 pixel_classification_standalone.py   <- THE deliverable (concatenation of the 4 below + CLI)
+ilastik_pc.py                        <- teaching copy: same algorithm, every optimization removed,
+                                        literal convolution loops, one-pixel-at-a-time forest walk.
+                                        `--explain Y X` prints a single pixel's whole derivation
+                                        (feature vector + each tree's decisions). Slow on purpose;
+                                        verified to give identical probabilities to the deliverable.
+                                        2D only. Not used by anything - it's for reading.
+REVIEW_FIXES.md                      <- code review of the above, the seven fixes made, and what
+                                        is measured vs merely reasoned. Read before optimizing.
 kernel1d.py                          <- vigra's exact Gaussian/derivative kernel construction
 nd_filters.py                        <- the 6 ilastik feature filters, built on kernel1d
 ilp_features.py                      <- OpPixelFeaturesPresmoothed's 2-stage scale composition
@@ -56,8 +64,10 @@ standalone_pipeline.py               <- wires ilp_project+ilp_features+vigra_rf_
                                          (pixel_classification_standalone.py IS these 5 files
                                          concatenated - keep them in sync if you edit one)
 dev_validation/                      <- scripts proving correctness against real vigra/fastfilters/
-                                         ilastik. All need a conda env (see PLAN.md), NOT part of
-                                         the pip-only deliverable.
+                                         ilastik. Mostly need a conda env (see PLAN.md), NOT part of
+                                         the pip-only deliverable. The exception is
+                                         test_standalone_no_conda.py, which needs only
+                                         numpy/scipy/h5py - run it on every change, it's seconds.
 reference/                           <- material ported from the feat/webgpu branch (an earlier,
                                          JS/WebGPU-targeted attempt at this same problem) - read-only
                                          reference, not used by the deliverable.
@@ -92,17 +102,29 @@ build step stitching them together — the concatenation was done by hand).
      container reset — budget ~5-10 min to rebuild if starting fresh.
 3. Run `dev_validation/compare_against_real_pipeline.py` before and after
    any change to `pixel_classification_standalone.py` to catch regressions.
+   Before reaching for conda at all, run
+   `dev_validation/test_standalone_no_conda.py` (numpy/scipy/h5py only,
+   seconds) - it covers the cases the one available fixture can't reach, and
+   checks both copies of the code.
+4. If you're onboarding someone else onto this, start them on
+   `ilastik_pc.py --explain`, not on the deliverable. It's the same algorithm
+   with the optimizations removed and a per-pixel trace.
 
 ## Open items (none blocking correctness)
 
 In rough priority order if you're picking a next task:
 
-1. **Feature-computation performance.** RF inference is fast now (~20s for
-   1.37M pixels); feature computation (the `nd_filters.py`/`ilp_features.py`
-   convolutions) is the larger remaining chunk of the ~47s full-image
-   runtime. Same kind of vectorization opportunity as the RF walker had, or
-   could lean harder on `scipy.ndimage`'s existing vectorization rather than
-   the current per-axis Python loop over `(feature, scale, channel)` triples.
+1. **Performance.** This item's premise was wrong and has been remeasured -
+   see REVIEW_FIXES.md for the profile. Feature computation is *not* the
+   larger chunk: on the full image it is ~8.3s against RF inference's ~20.7s.
+   Within feature computation, the cost is concentrated in the two
+   eigenvalue filters (~5.4s of 8.3s) - `np.linalg.eigvalsh` over ~1.4M small
+   matrices plus the tensor-component smoothing - not in convolution
+   scheduling. Redundant presmoothing has already been removed and was worth
+   only ~0.5s. So the two real targets, in order: RF inference (still the
+   single biggest term), then a closed-form 2x2/3x3 eigenvalue solver in
+   place of `eigvalsh` (`ilastik_pc.py`'s `eigenvalues_2x2` shows the 2D form,
+   and it is exact, not an approximation).
 2. **Packaging.** Still just a file someone downloads. Could become a real
    pip package (`pip install ilastik-standalone-pc` or similar) if that's
    wanted — the file is already dependency-clean, so this is mostly
