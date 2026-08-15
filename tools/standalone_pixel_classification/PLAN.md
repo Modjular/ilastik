@@ -84,24 +84,46 @@ Hessian eigenvalues additionally need a per-pixel 2x2/3x3 eigendecomposition —
 `numpy.linalg.eigh` on a stacked array, with attention to vigra's eigenvalue
 ordering convention: largest first).
 
-**2. Random Forest inference (vigra's `RandomForest.writeHDF5` format)**
+**2. Random Forest inference (vigra's `RandomForest.writeHDF5` format) — SOLVED**
 
-This is the actual unknown and the main risk in the plan. `ClassifierForests`
-in the `.ilp` is written by vigra's own `forest.writeHDF5(...)` — a binary/array
-HDF5 layout defined in vigra's C++ source (`rf_classnodes.hxx`), not documented
-anywhere in this repo or in the prior `feat/webgpu` work (that work only trained
-*new* forests in JS; it never had to read vigra's saved ones). To do inference
-without vigra installed, we need to:
-- dump the raw HDF5 group structure/arrays of `PixelClassification/ClassifierForests`
-  from a real trained `.ilp` (using the vigra env you can access) and reverse
-  engineer the topology/threshold/leaf-probability array encoding, or
-- find/confirm a public description of vigra's RF HDF5 node encoding to
-  cross-check against.
-Once decoded, prediction is simple: walk each tree's flat array per pixel-feature
-row and average per-tree class-probability leaves — structurally similar to the
-node encoding `rf.js`'s `FlatRandomForest` already uses for its own trees
-(`[feature_index, threshold, left_child, right_child]`-style flat arrays), just
-reading vigra's layout instead of writing our own.
+~~This was the actual unknown and the main risk in the plan.~~ Decoded and
+validated. `ClassifierForests` in the `.ilp` is written by vigra's own
+`forest.writeHDF5(...)`. The format (from vigra's own C++ headers, which ship
+inside the conda package at `<env>/include/vigra/random_forest/`) is:
+
+- `PixelClassification/ClassifierForests` holds N `Forest000N` sub-forests
+  (ilastik's `ParallelVigraRfLazyflowClassifier` splits training across cores;
+  at inference time their outputs are just tree-count-weighted-averaged back
+  together — see `lazyflow/classifiers/parallelVigraRfLazyflowClassifier.py:321-357`).
+- Each `Forest000N/Tree_NN` group has exactly two flat arrays:
+  `topology` (int32) and `parameters` (float64). `topology[0:2]` is
+  `[featureCount, classCount]`; traversal starts at index 2.
+- At each topology index: `typeID = topology[i]`. If
+  `typeID & 0x40000000` (`LeafNodeTag`), it's a leaf (`e_ConstProbNode`):
+  `parameters[addr+1 : addr+1+classCount]` are that leaf's per-class
+  probabilities (`addr = topology[i+1]`). Otherwise it's an axis-aligned
+  threshold split (`i_ThresholdNode`, the only split type ilastik's default RF
+  training produces): `column = topology[i+4]`,
+  `threshold = parameters[addr+1]`, next index is `topology[i+2]` if
+  `feature[column] < threshold` else `topology[i+3]`.
+- Per-forest probability = mean of all its trees' leaf probability vectors.
+  Across sub-forests: weighted-average by each sub-forest's tree count
+  (equivalent to averaging over every tree in every sub-forest).
+
+Implemented as **`vigra_rf_reader.py`** (this directory) — pure NumPy + h5py,
+zero vigra dependency — and validated against real
+`vigra.learning.RandomForest.predictProbabilities()` on 3 independently
+trained `.ilp` fixtures (`notebooks/pixel_classification_api/pc.ilp`,
+`tests/test_ilastik/data/inputdata/mitocheckPixelClassification.ilp` [40
+sub-forests], `tests/test_ilastik/data/inputdata/pc-oc-133.ilp` — 25 vs 49
+features, 4 vs 40 sub-forests). Max abs diff ~2.9e-8 across all three (float64
+accumulation-order noise, not a real discrepancy). See
+`dev_validation/validate_rf_reader_against_vigra.py` to reproduce (needs a
+vigra env — not needed to *use* `vigra_rf_reader.py` itself).
+
+Not yet exercised: vigra's `HyperplaneNode`/`HypersphereNode` split types
+(vigra supports them, but ilastik's default RF training only ever produces
+axis-aligned `ThresholdNode` splits, which is all 3 fixtures used).
 
 ## Everything else is already solved
 
@@ -114,11 +136,9 @@ close to verbatim.
 
 ## Proposed phases
 
-1. **Forest format research** (blocking, do first): using your vigra-enabled
-   env, dump `PixelClassification/ClassifierForests` from a couple of real
-   trained `.ilp` files (small forest, e.g. 2-class/10-tree, plus the bundled
-   `notebooks/pixel_classification_api/pc.ilp`) and reverse-engineer the array
-   encoding well enough to reimplement `predictProbabilities` in NumPy.
+1. **Forest format research** — DONE, see above. `vigra_rf_reader.py` is a
+   working, validated, dependency-light (h5py+numpy only) reader for
+   `ClassifierForests`.
 2. **Feature filters**: implement the 6 filter types + kernel builder in NumPy/
    SciPy, validate per-filter against `vigra.filters.*` output on a test array
    (same env) within float tolerance.
@@ -140,6 +160,30 @@ close to verbatim.
    and `pip install numpy scipy h5py tifffile` alongside, or also publish as
    a real pip package. Punt this decision until phases 1-3 prove the numerics
    actually match.
+
+## Vigra dev environment (for validation work)
+
+No conda was preinstalled in this session's container. Set one up like this
+(ephemeral — doesn't survive a container reset, ~5 min to rebuild):
+
+```bash
+curl -sS -L -o miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash miniconda.sh -b -p <prefix>/miniconda
+<prefix>/miniconda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+<prefix>/miniconda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+<prefix>/miniconda/bin/conda create -n vigra-env -c ilastik-forge -c conda-forge python=3.10 vigra fastfilters h5py numpy
+```
+
+Note: importing the *full* `lazyflow` package in this env fails (`ModuleNotFoundError: z5py`,
+which isn't pip-installable for py3.10 and isn't in this minimal env) — that's
+expected and fine, since the whole point is to avoid needing lazyflow. Talk to
+`vigra`/`h5py` directly instead, as `dev_validation/validate_rf_reader_against_vigra.py`
+does.
+
+Useful reference, also bundled with the conda `vigra` package itself, no
+internet needed: `<env>/include/vigra/random_forest/*.hxx` and
+`<env>/include/vigra/random_forest_hdf5_impex.hxx` — the actual C++ source
+defining the HDF5 format decoded above.
 
 ## Open questions for you
 
