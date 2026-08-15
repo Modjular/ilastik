@@ -97,12 +97,26 @@ needs the vigra/fastfilters conda env) across the full real ilastik scale set
 - **3D: gaussianSmoothing/laplacianOfGaussian/gaussianGradientMagnitude match
   the same way.** The two eigenvalue-based filters
   (`hessianOfGaussianEigenvalues`, `structureTensorEigenvalues`) show ~1e-4
-  residual differences at small scales on adversarial random-noise volumes —
-  confirmed (via sorted-multiset comparison) to be genuine tiny numerical
-  differences, not an eigenvalue-ordering bug, likely float32-vs-float64
-  accumulation amplified by near-degenerate eigenvalues. **Known, un-closed,
-  minor gap for 3D** — not expected to matter in practice (feature values feed
-  RF split thresholds, not exact comparisons) but flagging it as unfinished.
+  residual differences at small scales on adversarial random-noise volumes.
+  **Root cause identified (not just "known gap" anymore):** the raw tensor
+  components (before eigendecomposition) match `vigra.filters.hessianOfGaussian`
+  to the same ~1e-6/1e-7 precision as every other filter — the convolution
+  math is fine. The difference only appears *after* `eigvalsh`, and only at
+  pixels where two eigenvalues are nearly degenerate (checked directly: at the
+  single worst pixel in a test volume, two eigenvalues sat `0.0048` apart, and
+  a ~1e-6 difference in the input matrix — inevitable between two
+  independently-written convolution implementations that sum in a different
+  order — got amplified by roughly `1/eigengap ≈ 200×` into the observed ~1e-4
+  eigenvalue difference). **Confirmed this is not a dtype/precision issue**:
+  recomputing the same pixel with a full float64 pipeline (vs. the normal
+  float32-in/float32-out path scipy.ndimage uses by default) gave `0.00054293`
+  vs `0.00054288` — essentially identical, if anything marginally worse. This
+  only shows up on adversarial uncorrelated-noise test data (no dominant local
+  orientation → near-isotropic Hessians are common there); real, spatially
+  smooth microscopy images hit this condition far less often, and a 1e-4-scale
+  wobble in one channel of a ~50-dimensional feature vector feeding an RF
+  split threshold is unlikely to flip a prediction. Treating this as
+  understood-and-accepted rather than open.
 
 Found and had to work around one genuine **`fastfilters` bug**: its Python
 `structureTensorEigenvalues(image, innerScale, outerScale, window_size)` has a
@@ -195,39 +209,63 @@ close to verbatim.
 ## Proposed phases
 
 1. **Forest format research** — DONE. `vigra_rf_reader.py`, validated.
-2. **Feature filters** — DONE (2D fully; 3D minor known gap in eigenvalue
-   filters). `kernel1d.py` + `nd_filters.py`, validated.
+2. **Feature filters** — DONE (2D fully; 3D minor known-and-explained gap in
+   eigenvalue filters, see above). `kernel1d.py` + `nd_filters.py`, validated.
 3. **Presmoothing scale composition** — DONE. `ilp_features.py`, validated.
-4. **Assemble the single file** (next up): HDF5 `.ilp` parsing (axistags,
-   feature selection matrix, scales, label names — plain h5py/JSON, see
-   `ilastik/experimental/parser` for the existing pydantic version and
-   `reference/ILP_PixelClassification_Format.md` for the spec) + `ilp_features.py`
-   (per input channel, per selected (feature, scale) pair, concatenated in
-   FeatureIds-outer/Scales-inner order) + `vigra_rf_reader.py`, wired together
-   the same way `PixelClassificationPipeline`
-   (`ilastik/experimental/api/_pipelines.py`) does it conceptually, but without
-   any lazyflow/vigra underneath. Expose as both a small CLI
-   (`python pixel_classification_standalone.py project.ilp image.tif -o out.h5`,
-   modeled on `reference/run_pc_vigra_baseline.py`'s CLI) and an importable
-   function/class for notebook use. Target deps: `numpy`, `scipy`, `h5py`,
-   `tifffile` — all pip-installable, no compiled non-pip deps. Whether this
-   ends up as one literal `.py` file or a small package that's easy to vendor
-   as one is a packaging detail to settle in phase 6, not a blocker here —
-   `kernel1d.py` + `nd_filters.py` + `ilp_features.py` + `vigra_rf_reader.py`
-   are already written to have zero interdependencies beyond each other and
-   numpy/scipy/h5py, so concatenating them is straightforward whichever way
-   this goes.
-5. **End-to-end validation**: run both the real ilastik
-   `PixelClassificationPipeline` (conda env) and the standalone file on the
-   same `.ilp` + test image(s) (e.g. `notebooks/pixel_classification_api/pc.ilp`
-   + its bundled test image) and diff the final probability maps numerically.
-   Everything feeding into this (RF inference, filters, presmoothing
-   composition) is already validated piecewise; this step catches any
-   remaining wiring mistakes (feature ordering, per-channel handling, axis
-   order) in the assembly itself.
-6. **Packaging**: decide how it ships — single file people can just download
-   and `pip install numpy scipy h5py tifffile` alongside, or also publish as
-   a real pip package.
+4. **Assemble the single file** — DONE. `ilp_project.py` (HDF5 `.ilp` parsing:
+   axistags, feature selection matrix, scales, label names — plain h5py/JSON,
+   mirrors `ilastik/experimental/parser`'s field derivation without needing
+   pydantic/vigra) + `standalone_pipeline.py` (wires `ilp_project.py` +
+   `ilp_features.py` + `vigra_rf_reader.py` together the same way
+   `PixelClassificationPipeline` (`ilastik/experimental/api/_pipelines.py`)
+   does conceptually: reorder input to canonical `zyxc` spatial order, compute
+   every selected (feature, scale) block per input channel in
+   FeatureIds-outer/Scales-inner/channel-innermost order exactly matching
+   `OpPixelFeaturesPresmoothed`, flatten, run through the forest, reshape,
+   reorder output back to the trained project's original axis order). Exposes
+   the same `PixelClassificationPipeline.from_ilp_file(...).get_probabilities(...)`
+   interface as the real API (accepts an `xarray.DataArray` if xarray happens
+   to be installed, or a plain array + `dims=` otherwise), plus `ComputeIn2d`
+   handling for 3D (per-z-slice, matching `fastfilters`' own branch for it).
+   All four pieces then got concatenated into one literal file,
+   **`pixel_classification_standalone.py`** — the actual deliverable, ~600
+   lines, importable as a library or runnable as a CLI
+   (`python pixel_classification_standalone.py project.ilp image.tif -o probs.npy`).
+   Dependencies: `numpy`, `scipy`, `h5py` (required); `tifffile`/`imageio`
+   (CLI-only, for reading non-`.npy` image files); `xarray` (optional, only
+   changes how output is labeled). No compiled non-pip deps anywhere.
+5. **End-to-end validation** — DONE. Built a real Python 3.11 conda env with
+   the *actual* `ilastik.experimental.api.PixelClassificationPipeline`
+   working end-to-end (see "Full reference-pipeline environment" below — this
+   took real effort: `lazyflow` needs Python ≥ 3.11 for `enum.StrEnum`, pulls
+   in `z5py` which isn't used by anything relevant here, and a handful of
+   other packages). Ran both the real pipeline and
+   `pixel_classification_standalone.py` on the same trained project
+   (`notebooks/pixel_classification_api/pc.ilp`) and the same real test image
+   (`2d_cells_apoptotic_1channel.png`, a 64×64 crop for speed — see the
+   performance note below) and diffed the output:
+   - **Raw probabilities: max abs diff 2.86e-8, mean abs diff 1.25e-10** — the
+     same float64-accumulation-order noise floor seen in the RF-only
+     validation, i.e. no real discrepancy at all.
+   - **Binarized (argmax) predictions: 0 / 4096 pixels mismatched.**
+
+   This is now a reusable, standing test harness, not a one-off check:
+   **`dev_validation/compare_against_real_pipeline.py`**, runnable as
+   `python compare_against_real_pipeline.py <project.ilp> <image> [--crop Y0 Y1 X0 X1] [--atol ...]`.
+   It self-contains the `z5py`/`ilastik._version` workarounds (see below) so
+   it doesn't need any manual setup beyond having the reference conda env
+   active.
+6. **Packaging**: `pixel_classification_standalone.py` already ships as the
+   single file people can download and use directly, `pip install numpy
+   scipy h5py` (+ `tifffile`/`imageio` for the CLI) alongside. Publishing it
+   as a real installable pip package is still an open option, not yet done.
+7. **Performance (not yet addressed)**: `vigra_rf_reader.py`'s tree walker is
+   a pure-Python per-pixel/per-tree loop — fine for the 64×64 crop used above
+   (~1.5s), but ~500s (measured) for the full 1024×1344 `pc.ilp` test image
+   (100 trees × ~1.4M pixels). Correctness is fully proven; this is a known,
+   separate follow-up (batching/vectorizing the tree traversal, or falling
+   back to `numba`/`Cython` as an optional speed-up) before this is practical
+   for anything beyond small test images or crops.
 
 ## Vigra dev environment (for validation work)
 
@@ -253,14 +291,63 @@ internet needed: `<env>/include/vigra/random_forest/*.hxx` and
 `<env>/include/vigra/random_forest_hdf5_impex.hxx` — the actual C++ source
 defining the HDF5 format decoded above.
 
-## Open questions for you
+### Full reference-pipeline environment (for `compare_against_real_pipeline.py`)
 
-- Test fixtures: OK to use `notebooks/pixel_classification_api/pc.ilp` (already
-  in this repo, small, has a trained forest) as the primary validation project,
-  plus maybe one of the `tests/test_ilastik/data/inputdata/*PixelClassification*.ilp`
-  files for a second data point?
-- Should 3D (zyx) inputs be in scope for v1, or is 2D (yx/yxc) enough to start —
-  the eigenvalue-based features get more involved in 3D (3x3 vs 2x2 tensors).
-- Once phase 1 (forest format) is decoded, want it written up as its own doc
-  (like `ILP_PixelClassification_Format.md`) so it's reusable/shareable, or is
-  that overkill for what's just an internal implementation detail?
+Getting the *real* `ilastik.experimental.api.PixelClassificationPipeline`
+importable (needed as ground truth for the end-to-end comparison harness) is
+a step up from the vigra-only env above — `lazyflow`/`ilastik` pull in more
+than just vigra/fastfilters:
+
+```bash
+<prefix>/miniconda/bin/conda create -n vigra-env311 -c ilastik-forge -c conda-forge \
+    python=3.11 vigra fastfilters h5py numpy
+<env>/bin/pip install xarray pydantic future psutil greenlet scikit-learn imageio
+<prefix>/miniconda/bin/conda install -n vigra-env311 -c ilastik-forge -c conda-forge ndstructs
+```
+
+Notes:
+- **Python must be ≥ 3.11** — `lazyflow/utility/data_semantics.py` uses
+  `enum.StrEnum`, added in 3.11. The vigra-only env above used 3.10 (fine for
+  everything that doesn't need full `lazyflow`); this one needs 3.11+.
+  `ilastik-forge`/`conda-forge` do have `vigra`/`fastfilters` builds for 3.11.
+- `sklearn` is not a real pip package name (installs a deprecated shim that
+  errors) — install `scikit-learn` instead.
+- `ndstructs` isn't on PyPI for this Python version; install it from
+  `ilastik-forge` via conda instead of pip.
+- Two more things aren't real missing dependencies, just artifacts of running
+  from a plain source checkout instead of a proper install — both are handled
+  automatically inside `compare_against_real_pipeline.py`, no manual step
+  needed:
+  - `lazyflow/__init__.py` unconditionally does `import z5py` and calls
+    `z5py.set_json_encoder(...)` at import time, purely for N5 file I/O
+    support, which nothing in this comparison needs and which isn't
+    pip-installable for this Python version anyway. Stub it:
+    `sys.modules["z5py"] = types.ModuleType("z5py")` with a no-op
+    `set_json_encoder` attached, *before* importing `ilastik`.
+  - `ilastik/__init__.py` imports `ilastik._version`, normally generated by
+    `pip install -e .` (`setuptools_scm`). From a plain checkout it doesn't
+    exist; write a throwaway one-line stub (`version = "0.0.0.dev0"`) if
+    missing. Already gitignored (`ilastik/_version.py`), so this never ends
+    up in a commit.
+
+## Status
+
+Every phase above is done and validated, end to end, against a real trained
+`.ilp` project and the real `ilastik.experimental.api.PixelClassificationPipeline`.
+The standalone deliverable is `pixel_classification_standalone.py`; the
+standing regression/proof harness is `dev_validation/compare_against_real_pipeline.py`.
+Remaining open items, none of them blocking correctness:
+
+- **Performance**: the RF tree walker needs vectorizing/batching (or a
+  compiled fallback) before this is practical on full-size images, not just
+  crops — see phase 7 above.
+- **3D eigenvalue-filter precision**: root-caused (see the feature-filters
+  section above) but not "fixed" in the sense of closing the gap further —
+  probably not worth chasing given it's inherent to comparing two independent
+  floating-point implementations near eigenvalue degeneracy, not a bug.
+- **Autocontext / other workflows**: this only handles the Pixel
+  Classification workflow (`_PixelClassificationProject.from_ilp_file` raises
+  on anything else). `AutocontextPipeline` in the real API is out of scope
+  unless wanted later.
+- **Packaging**: still just a single `.py` file someone downloads; not
+  published as an installable package.
