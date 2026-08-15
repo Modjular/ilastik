@@ -65,24 +65,59 @@ out the whole problem well.
 
 ## The two real hurdles
 
-**1. Feature filters (vigra/fastfilters → pure NumPy/SciPy)**
+**1. Feature filters (vigra/fastfilters → pure NumPy/SciPy) — SOLVED (2D), mostly solved (3D)**
 
-Solvable, and largely de-risked by `ff_feature_math_reference.js`, which already
-worked out vigra's exact kernel construction:
-- dynamic kernel radius `ceil((3 + 0.5*order) * scale)`
-- strict per-order normalization (sum=1 for smoothing, 1st-moment=1 for the
-  1st derivative, zero-mean + variance-normalized for the 2nd derivative)
+Implemented as **`kernel1d.py`** + **`nd_filters.py`** (this directory) — pure
+NumPy/SciPy, zero vigra/fastfilters dependency. Derived from vigra's actual
+C++ source (`<env>/include/vigra/separableconvolution.hxx`, shipped inside the
+conda package), not guessed:
 
-`scipy.ndimage.correlate1d`/`gaussian_filter1d` with hand-built kernels (instead
-of scipy's built-in Gaussian, which truncates/normalizes differently) should be
-able to reproduce this bit-for-bit or very close. The six feature types
-(`GaussianSmoothing`, `LaplacianOfGaussian`, `GaussianGradientMagnitude`,
-`DifferenceOfGaussians`, `StructureTensorEigenvalues`,
-`HessianOfGaussianEigenvalues`) are all separable-Gaussian-derivative based, so
-this is one kernel builder + a handful of compositions (structure tensor and
-Hessian eigenvalues additionally need a per-pixel 2x2/3x3 eigendecomposition —
-`numpy.linalg.eigh` on a stacked array, with attention to vigra's eigenvalue
-ordering convention: largest first).
+- Kernel radius: `round(window_size * sigma)` (confirmed via `vigra.filters.Kernel1D`,
+  not the `ceil((3+0.5*order)*scale)` guess from the old `ff.js` reference).
+- Order 0 (smoothing): discretized Gaussian pdf, rescaled so it sums to 1.
+- Order ≥ 1 (derivatives): discretized analytic Gaussian derivative, zero-meaned,
+  then rescaled so its discrete moment exactly matches the analytic one
+  (corrects for truncation error) — this exact recipe, including the zero-mean
+  step for order 2, was reverse-engineered empirically against `vigra.filters.Kernel1D`
+  output and now matches it to machine precision (`~1e-16`) across every
+  (sigma, order, window_size) combination ilastik actually uses.
+- Boundary handling: `scipy.ndimage` mode `'mirror'` == vigra's
+  `BORDER_TREATMENT_REFLECT` (confirmed empirically).
+- All 6 filter types (`GaussianSmoothing`, `LaplacianOfGaussian`,
+  `GaussianGradientMagnitude`, `DifferenceOfGaussians`,
+  `StructureTensorEigenvalues`, `HessianOfGaussianEigenvalues`) built from
+  that one kernel builder + separable convolution + (for the last two)
+  per-pixel eigendecomposition (`numpy.linalg.eigvalsh`, sorted descending —
+  vigra's convention).
+
+Validated against real `fastfilters` output (`dev_validation/validate_filters_against_fastfilters.py`,
+needs the vigra/fastfilters conda env) across the full real ilastik scale set
+(`0.3, 0.7, 1.0, 1.6, 3.5, 5.0, 10.0`):
+- **2D: matches to ~1e-6/1e-7 for all 6 filter types, every scale.**
+- **3D: gaussianSmoothing/laplacianOfGaussian/gaussianGradientMagnitude match
+  the same way.** The two eigenvalue-based filters
+  (`hessianOfGaussianEigenvalues`, `structureTensorEigenvalues`) show ~1e-4
+  residual differences at small scales on adversarial random-noise volumes —
+  confirmed (via sorted-multiset comparison) to be genuine tiny numerical
+  differences, not an eigenvalue-ordering bug, likely float32-vs-float64
+  accumulation amplified by near-degenerate eigenvalues. **Known, un-closed,
+  minor gap for 3D** — not expected to matter in practice (feature values feed
+  RF split thresholds, not exact comparisons) but flagging it as unfinished.
+
+Found and had to work around one genuine **`fastfilters` bug**: its Python
+`structureTensorEigenvalues(image, innerScale, outerScale, window_size)` has a
+real parameter-order mismatch between its C header
+(`fastfilters_fir_structure_tensor2d(in, sigma_outer, sigma_inner, ...)`) and
+its C++/Python binding (`src/python/core.cxx`, `ConvolveST`), which passes its
+own `sigma_inner` into the C function's `sigma_outer` slot and vice versa. Net
+effect (confirmed empirically against real `svenpeter42/fastfilters` source
+and output): the Python-level `innerScale` argument ends up used as the
+tensor-smoothing scale, and `outerScale` ends up used as the gradient scale —
+backwards from the parameter names, and from what `vigra.filters.structureTensorEigenvalues`
+itself does. Since real trained `.ilp` projects are computed with `fastfilters`
+(ilastik prefers it when installed), `nd_filters.py`'s
+`structure_tensor_eigenvalues()` deliberately reproduces this swap — matching
+real projects' actual numbers, not the "textbook"/vigra ordering.
 
 **2. Random Forest inference (vigra's `RandomForest.writeHDF5` format) — SOLVED**
 
@@ -125,6 +160,29 @@ Not yet exercised: vigra's `HyperplaneNode`/`HypersphereNode` split types
 (vigra supports them, but ilastik's default RF training only ever produces
 axis-aligned `ThresholdNode` splits, which is all 3 fixtures used).
 
+**The "presmoothing" scale composition — SOLVED**
+
+`OpPixelFeaturesPresmoothed` doesn't call each feature filter at its nominal
+scale directly — for performance it presmooths the source once per unique
+scale column, then runs cheap small-window filters on top of that shared
+presmoothed image, changing the actual numbers involved (not just a speed
+trick):
+
+```
+temp_sigma, new_scale = (sqrt(s**2-1), 1.0) if s > 1 else (s, s)
+presmoothed = gaussian_smoothing(source, temp_sigma, window_size=3.5)
+feature_value = <feature filter>(presmoothed, new_scale, ..., window_size=2.0)
+```
+
+(For `s <= 1`, this really does mean smoothing twice at the same scale before
+running the feature filter — confirmed against source, not a bug I introduced.)
+
+Implemented as **`ilp_features.py`** (this directory), built on `nd_filters.py`.
+Validated end-to-end against the same composition built from real `fastfilters`
+calls (`dev_validation/validate_ilp_features_against_fastfilters.py`) across
+all 7 real scales × all 6 feature types (2D) — matches to ~1e-7/1e-8
+throughout.
+
 ## Everything else is already solved
 
 Parsing the rest of the `.ilp` (axis order, feature selection matrix, scales,
@@ -136,30 +194,40 @@ close to verbatim.
 
 ## Proposed phases
 
-1. **Forest format research** — DONE, see above. `vigra_rf_reader.py` is a
-   working, validated, dependency-light (h5py+numpy only) reader for
-   `ClassifierForests`.
-2. **Feature filters**: implement the 6 filter types + kernel builder in NumPy/
-   SciPy, validate per-filter against `vigra.filters.*` output on a test array
-   (same env) within float tolerance.
-3. **RF inference**: implement the decoded forest format as a flat-array NumPy
-   walker, validate against `rf.predictProbabilities(...)` on real feature data.
-4. **Assemble the single file**: HDF5 `.ilp` parsing (axistags, feature
-   selection matrix, label names) + phase 2 + phase 3, wired together the same
-   way `PixelClassificationPipeline` does it, exposed as both a small CLI
+1. **Forest format research** — DONE. `vigra_rf_reader.py`, validated.
+2. **Feature filters** — DONE (2D fully; 3D minor known gap in eigenvalue
+   filters). `kernel1d.py` + `nd_filters.py`, validated.
+3. **Presmoothing scale composition** — DONE. `ilp_features.py`, validated.
+4. **Assemble the single file** (next up): HDF5 `.ilp` parsing (axistags,
+   feature selection matrix, scales, label names — plain h5py/JSON, see
+   `ilastik/experimental/parser` for the existing pydantic version and
+   `reference/ILP_PixelClassification_Format.md` for the spec) + `ilp_features.py`
+   (per input channel, per selected (feature, scale) pair, concatenated in
+   FeatureIds-outer/Scales-inner order) + `vigra_rf_reader.py`, wired together
+   the same way `PixelClassificationPipeline`
+   (`ilastik/experimental/api/_pipelines.py`) does it conceptually, but without
+   any lazyflow/vigra underneath. Expose as both a small CLI
    (`python pixel_classification_standalone.py project.ilp image.tif -o out.h5`,
-   modeled on `run_pc_vigra_baseline.py`'s CLI) and an importable function/class
-   for notebook use. Target deps: `numpy`, `scipy`, `h5py`, `tifffile` — all
-   pip-installable, no compiled non-pip deps.
+   modeled on `reference/run_pc_vigra_baseline.py`'s CLI) and an importable
+   function/class for notebook use. Target deps: `numpy`, `scipy`, `h5py`,
+   `tifffile` — all pip-installable, no compiled non-pip deps. Whether this
+   ends up as one literal `.py` file or a small package that's easy to vendor
+   as one is a packaging detail to settle in phase 6, not a blocker here —
+   `kernel1d.py` + `nd_filters.py` + `ilp_features.py` + `vigra_rf_reader.py`
+   are already written to have zero interdependencies beyond each other and
+   numpy/scipy/h5py, so concatenating them is straightforward whichever way
+   this goes.
 5. **End-to-end validation**: run both the real ilastik
    `PixelClassificationPipeline` (conda env) and the standalone file on the
-   same `.ilp` + test image(s) and diff the probability maps numerically
-   (tolerance-based, not bit-exact, since Gaussian kernel truncation/float
-   accumulation order can differ slightly).
+   same `.ilp` + test image(s) (e.g. `notebooks/pixel_classification_api/pc.ilp`
+   + its bundled test image) and diff the final probability maps numerically.
+   Everything feeding into this (RF inference, filters, presmoothing
+   composition) is already validated piecewise; this step catches any
+   remaining wiring mistakes (feature ordering, per-channel handling, axis
+   order) in the assembly itself.
 6. **Packaging**: decide how it ships — single file people can just download
    and `pip install numpy scipy h5py tifffile` alongside, or also publish as
-   a real pip package. Punt this decision until phases 1-3 prove the numerics
-   actually match.
+   a real pip package.
 
 ## Vigra dev environment (for validation work)
 
