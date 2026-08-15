@@ -39,6 +39,17 @@ i_ThresholdNode (axis-aligned split) and e_ConstProbNode (leaf), which is what
 ilastik's default RandomForest training produces; the HyperplaneNode/
 HypersphereNode variants vigra also supports were not exercised.
 
+Performance: predict_probabilities() walks every pixel through every tree
+level-by-level, vectorized across all pixels at once (a NumPy array holding
+each pixel's current node index, updated in a batch each iteration), instead
+of one Python-level tree descent per pixel. The Python-level loop only runs
+O(tree depth) times per tree rather than O(n_pixels); each iteration does a
+handful of NumPy gather/compare ops over however many pixels are still
+active (haven't reached a leaf yet). Confirmed to produce bit-identical
+results to the old one-pixel-at-a-time version (see
+dev_validation/validate_rf_reader_against_vigra.py) - only the traversal
+order/vectorization changed, not the algorithm.
+
 Only dependencies: h5py, numpy. No vigra.
 """
 import h5py
@@ -55,6 +66,8 @@ class DecodedTree:
         self.class_count = int(topology[1])
 
     def predict_row(self, feature_row: np.ndarray) -> np.ndarray:
+        """Single-pixel reference implementation - kept for clarity/testing;
+        predict_all(...) is the vectorized version actually used for bulk work."""
         topo = self.topology
         params = self.parameters
         index = 2
@@ -70,6 +83,53 @@ class DecodedTree:
             column = topo[index + 4]
             threshold = params[addr + 1]
             index = child0 if feature_row[column] < threshold else child1
+
+    def predict_all(self, X: np.ndarray) -> np.ndarray:
+        """
+        Vectorized equivalent of calling predict_row(row) for every row in X.
+        Walks all rows through the tree simultaneously, level by level: at
+        each iteration, rows still at an internal (threshold) node advance to
+        their child; rows that just reached a leaf have their probabilities
+        gathered and are marked done. Runs O(tree depth) Python-level
+        iterations total, not O(n_rows).
+        """
+        topo = self.topology
+        params = self.parameters
+        n_rows = X.shape[0]
+        class_count = self.class_count
+
+        node_index = np.full(n_rows, 2, dtype=np.intp)
+        result = np.empty((n_rows, class_count), dtype=np.float64)
+        done = np.zeros(n_rows, dtype=bool)
+        active = np.arange(n_rows)
+        class_offsets = np.arange(1, class_count + 1)
+
+        while active.size:
+            cur_nodes = node_index[active]
+            type_ids = topo[cur_nodes]
+            is_leaf = (type_ids & LEAF_NODE_TAG).astype(bool)
+
+            leaf_rows = active[is_leaf]
+            if leaf_rows.size:
+                leaf_nodes = node_index[leaf_rows]
+                addrs = topo[leaf_nodes + 1]
+                result[leaf_rows] = params[addrs[:, None] + class_offsets[None, :]]
+                done[leaf_rows] = True
+
+            internal_rows = active[~is_leaf]
+            if internal_rows.size:
+                internal_nodes = node_index[internal_rows]
+                addrs = topo[internal_nodes + 1]
+                child0 = topo[internal_nodes + 2]
+                child1 = topo[internal_nodes + 3]
+                columns = topo[internal_nodes + 4]
+                thresholds = params[addrs + 1]
+                feature_values = X[internal_rows, columns]
+                node_index[internal_rows] = np.where(feature_values < thresholds, child0, child1)
+
+            active = internal_rows
+
+        return result
 
 
 class DecodedForest:
@@ -90,14 +150,10 @@ class DecodedForest:
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
         class_count = self.trees[0].class_count
-        out = np.zeros((n_rows, class_count), dtype=np.float64)
-        for row_i in range(n_rows):
-            row = X[row_i]
-            acc = np.zeros(class_count, dtype=np.float64)
-            for tree in self.trees:
-                acc += tree.predict_row(row)
-            out[row_i] = acc / len(self.trees)
-        return out
+        acc = np.zeros((n_rows, class_count), dtype=np.float64)
+        for tree in self.trees:
+            acc += tree.predict_all(X)
+        return acc / len(self.trees)
 
 
 class DecodedParallelForest:

@@ -259,13 +259,70 @@ close to verbatim.
    single file people can download and use directly, `pip install numpy
    scipy h5py` (+ `tifffile`/`imageio` for the CLI) alongside. Publishing it
    as a real installable pip package is still an open option, not yet done.
-7. **Performance (not yet addressed)**: `vigra_rf_reader.py`'s tree walker is
-   a pure-Python per-pixel/per-tree loop — fine for the 64×64 crop used above
-   (~1.5s), but ~500s (measured) for the full 1024×1344 `pc.ilp` test image
-   (100 trees × ~1.4M pixels). Correctness is fully proven; this is a known,
-   separate follow-up (batching/vectorizing the tree traversal, or falling
-   back to `numba`/`Cython` as an optional speed-up) before this is practical
-   for anything beyond small test images or crops.
+7. **Performance** — DONE. `vigra_rf_reader.py`'s (and
+   `pixel_classification_standalone.py`'s embedded copy's) tree walker was a
+   pure-Python per-pixel/per-tree loop — ~500s (measured) for the full
+   1024×1344 `pc.ilp` test image (100 trees × ~1.4M pixels). Rewrote it to
+   walk every pixel through a tree simultaneously, level by level: a NumPy
+   array holds each pixel's current node index, updated in one vectorized
+   batch per iteration, so the Python-level loop runs `O(tree depth)` times
+   per tree instead of `O(n_pixels)` times. Confirmed bit-identical output to
+   the old version (`dev_validation/validate_rf_reader_against_vigra.py`
+   gives the exact same diff numbers, `2.8610229518832853e-08`, before and
+   after — only the traversal order changed, not the algorithm). **Result:
+   ~500s → ~20s for RF inference alone (~25×); ~47s measured for the full
+   `pixel_classification_standalone.py` pipeline end-to-end on the full
+   1024×1344 image (features + RF), down from what would have been ~500-600s+
+   total.** Feature computation (not touched by this round) is now the
+   larger share of total runtime; vectorizing/batching that further is a
+   possible future follow-up but wasn't needed to hit "practical for a real
+   image," which was the goal.
+
+### Full-image validation: RF decision-boundary sensitivity (found during performance testing, not a bug)
+
+Testing the *full* 1024×1344 `pc.ilp` image end-to-end (only practical after
+the performance fix above) surfaced something the 64×64 crop never hit:
+**12 / 1,376,256 pixels (0.00087%) with a different binarized (argmax)
+prediction** than the real pipeline, and a handful of pixels with raw
+probability differences up to ~0.09 (vs. the ~1e-8 noise floor seen
+everywhere else). Traced to ground truth, not assumed:
+
+- Several of the 12 "mismatches" are pixels where **both** implementations
+  independently landed on an exact `[0.5, 0.5]` tie — `argmax` breaks ties by
+  index, so a `~1e-8`-level float difference on either side of the tie flips
+  which class "wins" a coin flip that was already 50/50. Not a real
+  disagreement.
+- For the larger ones (e.g. pixel `(469, 147)`: real `[0.35, 0.65]` vs.
+  standalone `[0.26, 0.74]`), pulled the actual 49-value feature vector at
+  that exact pixel from both the real `OpFeatureSelection` operator and
+  `standalone_pipeline.py`'s `_compute_features` and diffed feature-by-feature.
+  **The raw features match to ~1e-5/1e-6** (e.g.
+  `HessianOfGaussianEigenvalues@0.7` differs by `0.000007`,
+  `LaplacianOfGaussian@0.7` by `0.000009`) — the ordinary level of
+  disagreement between two independently-written convolution
+  implementations, consistent with everything validated elsewhere in this
+  plan. There's no large per-feature error anywhere.
+- Random forests are piecewise-constant (every split is an exact
+  `feature[col] < threshold` test). At a pixel whose true feature vector
+  happens to sit almost exactly on one of the ~100 trees' split thresholds,
+  a `~1e-6`-level nudge is enough to flip that tree's branch — and if several
+  of the 100 trees share a similar threshold near that same point (plausible,
+  since they're bootstrap samples of the same training set), enough of them
+  can flip in the same direction to move the ensemble average by something
+  as large as `0.09`, even though the underlying computation is off by
+  next to nothing.
+
+This is inherent to comparing two independently-implemented floating-point
+pipelines through an ensemble of exact-threshold decision trees — not a
+defect introduced by this session's work, and not something the performance
+change caused (the RF walker was proven bit-identical before/after
+vectorizing, and this exact discrepancy was already latent in the original
+row-by-row implementation; the 64×64 crop just never happened to contain one
+of these rare boundary pixels). Not worth chasing further: closing it would
+mean bit-exact-replicating `fastfilters`' internal convolution summation
+order, which isn't really achievable (or meaningful) when comparing against
+a separate C++ implementation. Rate observed: 12 boundary-sensitive pixels
+out of 1,376,256 (0.00087%) on one real image.
 
 ## Vigra dev environment (for validation work)
 
@@ -338,9 +395,11 @@ The standalone deliverable is `pixel_classification_standalone.py`; the
 standing regression/proof harness is `dev_validation/compare_against_real_pipeline.py`.
 Remaining open items, none of them blocking correctness:
 
-- **Performance**: the RF tree walker needs vectorizing/batching (or a
-  compiled fallback) before this is practical on full-size images, not just
-  crops — see phase 7 above.
+- **Feature-computation performance**: RF inference is now fast (~20s for
+  1.37M pixels); feature computation is the larger remaining share of the
+  ~47s full-image runtime. Not urgent (this is already a >10x improvement
+  and "practical for a real image" was the bar), but a candidate for a future
+  round if it needs to be faster still.
 - **3D eigenvalue-filter precision**: root-caused (see the feature-filters
   section above) but not "fixed" in the sense of closing the gap further —
   probably not worth chasing given it's inherent to comparing two independent
