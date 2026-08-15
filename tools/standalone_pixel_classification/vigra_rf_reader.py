@@ -147,6 +147,13 @@ class DecodedForest:
             trees.append(DecodedTree(t["topology"][:], t["parameters"][:]))
         return cls(trees)
 
+    @property
+    def feature_count(self) -> int:
+        counts = {t.feature_count for t in self.trees}
+        if len(counts) != 1:
+            raise ValueError(f"Trees within a sub-forest disagree on feature count: {sorted(counts)}")
+        return counts.pop()
+
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
         class_count = self.trees[0].class_count
@@ -159,19 +166,48 @@ class DecodedForest:
 class DecodedParallelForest:
     """The full 'ClassifierForests' group: several Forest000N sub-forests, averaged."""
 
-    def __init__(self, forests):
+    def __init__(self, forests, known_labels=None):
         self.forests = forests
         self.total_trees = sum(len(f.trees) for f in forests)
+        # Which label each of the forest's probability columns corresponds to.
+        # See from_ilp() for where this comes from and why it isn't just
+        # range(1, class_count + 1).
+        self.known_labels = list(known_labels) if known_labels is not None else list(range(1, self.class_count + 1))
+
+    @property
+    def feature_count(self) -> int:
+        """Number of feature columns the forest was trained on."""
+        counts = {f.feature_count for f in self.forests}
+        if len(counts) != 1:
+            raise ValueError(f"Sub-forests disagree on feature count: {sorted(counts)}")
+        return counts.pop()
+
+    @property
+    def class_count(self) -> int:
+        """Number of probability columns the forest emits (== len(known_labels))."""
+        return self.forests[0].trees[0].class_count
 
     @classmethod
     def from_ilp(cls, path: str, group_path: str = "PixelClassification/ClassifierForests") -> "DecodedParallelForest":
         forests = []
+        known_labels = None
         with h5py.File(path, "r") as f:
             grp = f[group_path]
             for name in sorted(grp.keys()):
                 if name.startswith("Forest"):
                     forests.append(DecodedForest.from_h5_group(grp[name]))
-        return cls(forests)
+            # The forest only has a column per label that actually had training
+            # samples, so a label the user defined but never painted is missing
+            # from the output entirely. ilastik stores the surviving label ids
+            # here (ParallelVigraRfLazyflowClassifier.serialize_hdf5) and uses
+            # them to scatter the columns back into full label space on predict.
+            if "known_labels" in grp:
+                known_labels = [int(v) for v in grp["known_labels"][:]]
+            # Older projects predate the dataset; then no labels were dropped
+            # and the columns are simply labels 1..class_count, which is what
+            # ParallelVigraRfLazyflowClassifier.deserialize_hdf5 falls back to.
+
+        return cls(forests, known_labels=known_labels)
 
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]

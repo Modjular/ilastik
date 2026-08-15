@@ -295,9 +295,91 @@ def _compute_feature(presmoothed: np.ndarray, feature_id: str, new_scale: float)
 
 
 def compute_feature_at_scale(source: np.ndarray, feature_id: str, scale: float) -> np.ndarray:
-    """source: single-channel 2D or 3D array (one input channel)."""
+    """
+    Both stages in one call, for a single channel. The pipeline below doesn't
+    use this - it splits the stages so one presmoothed image can be shared by
+    every feature at that scale - but it is the clearest statement of the
+    composition, and the dev validation scripts check against it.
+    """
     temp_sigma, new_scale = _presmoothing_sigma_and_new_scale(scale)
     presmoothed = gaussian_smoothing(source, temp_sigma, _PRESMOOTHING_WINDOW_SIZE)
+    return _compute_feature(presmoothed, feature_id, new_scale)
+
+
+def _feature_scale_args(feature_id: str, new_scale: float):
+    """
+    The scale arguments OpBaseFilter passes to this filter's filter_fn, in the
+    order they appear in _compute_feature above. Only used to decide whether the
+    filter fits along z (see _filter_forced_to_2d).
+    """
+    if feature_id in ("GaussianSmoothing", "LaplacianOfGaussian", "GaussianGradientMagnitude"):
+        return (new_scale,)
+    elif feature_id == "DifferenceOfGaussians":
+        return (new_scale, new_scale * 0.66)
+    elif feature_id == "StructureTensorEigenvalues":
+        return (new_scale, new_scale * 0.5)
+    elif feature_id == "HessianOfGaussianEigenvalues":
+        return (new_scale,)
+    else:
+        raise ValueError(f"Unknown feature id {feature_id!r}")
+
+
+def _filter_forced_to_2d(feature_id: str, new_scale: float, z_extent) -> bool:
+    """
+    Reproduces OpBaseFilter.setupOutputs' `invalid_z` (filterOperators.py):
+
+        invalid_z = z_dim == 1 or any(ceil(s * window_size_feature) + 1 > z_dim
+                                      for s in filter_scales)
+
+    A volume too thin for the filter's own kernel along z is filtered slice by
+    slice instead of failing. Since presmoothing caps new_scale at 1.0, the
+    usual threshold is ceil(2.0) + 1 == 3, i.e. 3D filtering needs z >= 3.
+
+    This applies to the feature filters ONLY, not to presmoothing, which keys
+    off ComputeIn2d alone (opPixelFeaturesPresmoothed's _computeGaussianSmoothing
+    passes in2d=self.ComputeIn2d.value[j] and never consults invalid_z). On a
+    thin-z volume with ComputeIn2d unset, ilastik therefore presmooths in 3D and
+    then filters in 2D. That asymmetry looks like an oversight, but it is what
+    trained projects were computed with, so it is reproduced rather than tidied.
+
+    z_extent: length of the z axis, or None for genuinely 2D data.
+    """
+    if z_extent is None:
+        return False
+    if z_extent == 1:
+        return True
+    return any(math.ceil(s * _FEATURE_WINDOW_SIZE) + 1 > z_extent for s in _feature_scale_args(feature_id, new_scale))
+
+
+def _per_slice(volume: np.ndarray, fn):
+    """Apply fn to each z slice of a 3D volume and stack the results back up."""
+    return np.stack([fn(volume[z]) for z in range(volume.shape[0])], axis=0)
+
+
+def _presmooth(source: np.ndarray, scale: float, in_2d: bool = False) -> np.ndarray:
+    """
+    Stage one: smooth the source at this scale column's temp_sigma, with the
+    wider (3.5) presmoothing window. Depends only on the scale column and the
+    input channel, so it is computed once per (scale, channel) rather than once
+    per (feature, scale, channel).
+    """
+    temp_sigma, _ = _presmoothing_sigma_and_new_scale(scale)
+    if in_2d and source.ndim == 3:
+        return _per_slice(source, lambda sl: gaussian_smoothing(sl, temp_sigma, _PRESMOOTHING_WINDOW_SIZE))
+    return gaussian_smoothing(source, temp_sigma, _PRESMOOTHING_WINDOW_SIZE)
+
+
+def _compute_feature_maybe_2d(
+    presmoothed: np.ndarray, feature_id: str, new_scale: float, in_2d: bool = False
+) -> np.ndarray:
+    """
+    Stage two, optionally slice by slice. Filtering a 3D volume per z slice also
+    drops the eigenvalue-based features from 3 channels to 2, since each slice's
+    eigendecomposition is 2x2 - which is what ilastik's _n_per_space_axis does
+    for its output channel count.
+    """
+    if in_2d and presmoothed.ndim == 3:
+        return _per_slice(presmoothed, lambda sl: _compute_feature(sl, feature_id, new_scale))
     return _compute_feature(presmoothed, feature_id, new_scale)
 
 
@@ -408,6 +490,13 @@ class _DecodedForest:
         trees = [_DecodedTree(group[name]["topology"][:], group[name]["parameters"][:]) for name in tree_names]
         return cls(trees)
 
+    @property
+    def feature_count(self) -> int:
+        counts = {t.feature_count for t in self.trees}
+        if len(counts) != 1:
+            raise ValueError(f"Trees within a sub-forest disagree on feature count: {sorted(counts)}")
+        return counts.pop()
+
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
         class_count = self.trees[0].class_count
@@ -420,19 +509,48 @@ class _DecodedForest:
 class DecodedParallelForest:
     """The full 'ClassifierForests' group: several Forest000N sub-forests, averaged."""
 
-    def __init__(self, forests):
+    def __init__(self, forests, known_labels=None):
         self.forests = forests
         self.total_trees = sum(len(f.trees) for f in forests)
+        # Which label each of the forest's probability columns corresponds to.
+        # See from_ilp() for where this comes from and why it isn't just
+        # range(1, class_count + 1).
+        self.known_labels = list(known_labels) if known_labels is not None else list(range(1, self.class_count + 1))
+
+    @property
+    def feature_count(self) -> int:
+        """Number of feature columns the forest was trained on."""
+        counts = {f.feature_count for f in self.forests}
+        if len(counts) != 1:
+            raise ValueError(f"Sub-forests disagree on feature count: {sorted(counts)}")
+        return counts.pop()
+
+    @property
+    def class_count(self) -> int:
+        """Number of probability columns the forest emits (== len(known_labels))."""
+        return self.forests[0].trees[0].class_count
 
     @classmethod
     def from_ilp(cls, path: str, group_path: str = "PixelClassification/ClassifierForests") -> "DecodedParallelForest":
         forests = []
+        known_labels = None
         with h5py.File(path, "r") as f:
             grp = f[group_path]
             for name in sorted(grp.keys()):
                 if name.startswith("Forest"):
                     forests.append(_DecodedForest.from_h5_group(grp[name]))
-        return cls(forests)
+            # The forest only has a column per label that actually had training
+            # samples, so a label the user defined but never painted is missing
+            # from the output entirely. ilastik stores the surviving label ids
+            # here (ParallelVigraRfLazyflowClassifier.serialize_hdf5) and uses
+            # them to scatter the columns back into full label space on predict.
+            if "known_labels" in grp:
+                known_labels = [int(v) for v in grp["known_labels"][:]]
+            # Older projects predate the dataset; then no labels were dropped and
+            # the columns are simply labels 1..class_count, which is what
+            # ParallelVigraRfLazyflowClassifier.deserialize_hdf5 falls back to.
+
+        return cls(forests, known_labels=known_labels)
 
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
@@ -482,6 +600,11 @@ class _FeatureMatrix:
     scales: List[float]
     selections: np.ndarray  # bool, shape (len(feature_ids), len(scales))
     compute_in_2d: np.ndarray  # bool, shape (len(scales),)
+    # False when the project stored no ComputeIn2d dataset. ilastik fills an
+    # unset ComputeIn2d from the *input's* z extent at prediction time rather
+    # than from anything in the file (OpPixelFeaturesPresmoothed.setupOutputs),
+    # so the pipeline can only resolve it once it has the data in hand.
+    compute_in_2d_from_project: bool = True
 
 
 @dataclass
@@ -521,10 +644,11 @@ class _PixelClassificationProject:
             feature_ids = _decode_str_list(fs["FeatureIds"])
             scales = list(fs["Scales"][()])
             selections = np.asarray(fs["SelectionMatrix"][()], dtype=bool)
-            if "ComputeIn2d" in fs:
+            compute_in_2d_from_project = "ComputeIn2d" in fs
+            if compute_in_2d_from_project:
                 compute_in_2d = np.asarray(fs["ComputeIn2d"][()], dtype=bool)
             else:
-                compute_in_2d = np.zeros(len(scales), dtype=bool)
+                compute_in_2d = np.zeros(len(scales), dtype=bool)  # placeholder; resolved against the input's z
 
             label_names = _decode_str_list(f["PixelClassification"]["LabelNames"])
 
@@ -534,7 +658,11 @@ class _PixelClassificationProject:
             workflow_name=workflow_name,
             input_data=_InputDataInfo(axis_order=axis_order, num_channels=num_channels),
             feature_matrix=_FeatureMatrix(
-                feature_ids=feature_ids, scales=scales, selections=selections, compute_in_2d=compute_in_2d
+                feature_ids=feature_ids,
+                scales=scales,
+                selections=selections,
+                compute_in_2d=compute_in_2d,
+                compute_in_2d_from_project=compute_in_2d_from_project,
             ),
             label_names=label_names,
             forest=forest,
@@ -548,6 +676,30 @@ def _ensure_channel_axis(axis_order: str) -> str:
 def _canonical_spatial_order(spatial_axes_present: str) -> str:
     """Internal computation order, matching lazyflow's OpReorderAxes(AxisOrder='tczyx')."""
     return "".join(a for a in "zyx" if a in spatial_axes_present)
+
+
+def _drop_singleton_extra_axes(values: np.ndarray, dims: Tuple[str, ...]):
+    """
+    Drop length-1 axes that aren't spatial or channel - in practice a singleton
+    't' from a time-series file that only holds one frame.
+
+    Without this such an axis passes the channel and spatial-count checks (which
+    only look at 'c' and 'xyz'), is then left out of the transpose's target
+    order, and dies in np.transpose with "axes don't match array".
+    """
+    extra = [(d, values.shape[i]) for i, d in enumerate(dims) if d not in "xyzc"]
+    if not extra:
+        return values, dims
+
+    too_long = [f"{d} (length {n})" for d, n in extra if n != 1]
+    if too_long:
+        raise ValueError(
+            f"Unsupported non-spatial axes: {', '.join(too_long)}. Only x, y, z and c are "
+            "supported; a time series has to be predicted one frame at a time."
+        )
+
+    index = tuple(slice(None) if d in "xyzc" else 0 for d in dims)
+    return values[index], tuple(d for d in dims if d in "xyzc")
 
 
 class PixelClassificationPipeline:
@@ -571,30 +723,105 @@ class PixelClassificationPipeline:
         self._num_channels = project.input_data.num_channels
         self._output_axis_order = _ensure_channel_axis(project.input_data.axis_order)
 
-    def _compute_feature_maybe_2d(self, channel_img: np.ndarray, feature_id: str, scale: float, compute_in_2d: bool):
-        if compute_in_2d and channel_img.ndim == 3:
-            slices = [compute_feature_at_scale(channel_img[z], feature_id, scale) for z in range(channel_img.shape[0])]
-            return np.stack(slices, axis=0)
-        return compute_feature_at_scale(channel_img, feature_id, scale)
+    def _resolve_compute_in_2d(self, z_extent) -> np.ndarray:
+        """
+        A project that stores no ComputeIn2d gets one filled in from the input's
+        z extent at prediction time, not from the file:
+
+            if not self.ComputeIn2d.value:
+                if self.Input.meta.shape[2] == 1:  # z
+                    ComputeIn2d = [True] * len(scales)
+                else:
+                    ComputeIn2d = [False] * len(scales)
+
+        (OpPixelFeaturesPresmoothed.setupOutputs). Defaulting to all-False here
+        instead would diverge on single-slice input.
+        """
+        fm = self._project.feature_matrix
+        if fm.compute_in_2d_from_project:
+            return fm.compute_in_2d
+        return np.full(len(fm.scales), z_extent == 1, dtype=bool)
 
     def _compute_features(self, data_zyxc: np.ndarray) -> np.ndarray:
+        """
+        Iterated scale-column-outer so that each presmoothed image is built once
+        and shared by every feature selected at that scale (presmoothing depends
+        only on the scale column and the input channel, and uses the wider 3.5
+        window, so it is the expensive half). The blocks are still emitted
+        feature-major, which is the order ilastik's channel layout - and
+        therefore the trained forest's feature columns - requires.
+        """
         fm = self._project.feature_matrix
         num_input_channels = data_zyxc.shape[-1]
+        num_spatial_dims = data_zyxc.ndim - 1
+        z_extent = data_zyxc.shape[0] if num_spatial_dims == 3 else None
+        compute_in_2d = self._resolve_compute_in_2d(z_extent)
 
-        blocks = []
-        for i, feature_id in enumerate(fm.feature_ids):
-            for j, scale in enumerate(fm.scales):
-                if not fm.selections[i, j]:
-                    continue
-                compute_in_2d = bool(fm.compute_in_2d[j])
-                for c in range(num_input_channels):
-                    channel_img = data_zyxc[..., c]
-                    feat = self._compute_feature_maybe_2d(channel_img, feature_id, scale, compute_in_2d)
-                    if feat.ndim == channel_img.ndim:
+        blocks = {}
+        for j, scale in enumerate(fm.scales):
+            selected = [i for i in range(len(fm.feature_ids)) if fm.selections[i, j]]
+            if not selected:
+                continue
+
+            presmooth_in_2d = bool(compute_in_2d[j])
+            _, new_scale = _presmoothing_sigma_and_new_scale(scale)
+
+            for c in range(num_input_channels):
+                presmoothed = _presmooth(data_zyxc[..., c], scale, in_2d=presmooth_in_2d)
+                for i in selected:
+                    feature_id = fm.feature_ids[i]
+                    # invalid_z applies to the filter but not to the presmoothing
+                    # above - see _filter_forced_to_2d.
+                    filter_in_2d = presmooth_in_2d or _filter_forced_to_2d(feature_id, new_scale, z_extent)
+                    feat = _compute_feature_maybe_2d(presmoothed, feature_id, new_scale, in_2d=filter_in_2d)
+                    if feat.ndim == presmoothed.ndim:
                         feat = feat[..., np.newaxis]
-                    blocks.append(feat)
+                    blocks[(i, j, c)] = feat
 
-        return np.concatenate(blocks, axis=-1)
+        ordered = [
+            blocks[(i, j, c)]
+            for i in range(len(fm.feature_ids))
+            for j in range(len(fm.scales))
+            for c in range(num_input_channels)
+            if (i, j, c) in blocks
+        ]
+        return np.concatenate(ordered, axis=-1)
+
+    def _expand_to_label_space(self, probs: np.ndarray) -> np.ndarray:
+        """
+        The forest only carries a column for each label that had training
+        samples, so a label the user defined but never painted is absent from
+        its output. ilastik reinstates it (classifierOperators.py):
+
+            for i, label in enumerate(classifier.known_classes):
+                full_probabilities[..., label - 1] = probabilities[..., i]
+
+        Without this the output has too few channels AND the surviving classes
+        sit at the wrong indices - e.g. known_labels [1, 3] of 3 labels puts
+        label 3's probabilities in channel 1, where callers expect label 2's.
+        """
+        n_labels = self._project.label_count
+        known = self._project.forest.known_labels
+
+        if known == list(range(1, n_labels + 1)):
+            return probs  # nothing was dropped; columns already line up
+
+        if probs.shape[-1] != len(known):
+            raise ValueError(
+                f"Classifier emits {probs.shape[-1]} probability columns but its known_labels "
+                f"lists {len(known)} entries ({known}); the project file is inconsistent."
+            )
+        out_of_range = [label for label in known if not 1 <= label <= n_labels]
+        if out_of_range:
+            raise ValueError(
+                f"Classifier known_labels {out_of_range} fall outside the project's "
+                f"{n_labels} label(s) ({self._project.label_names}); the project file is inconsistent."
+            )
+
+        full = np.zeros(probs.shape[:-1] + (n_labels,), dtype=probs.dtype)
+        for i, label in enumerate(known):
+            full[..., label - 1] = probs[..., i]
+        return full
 
     def get_probabilities(
         self,
@@ -615,6 +842,8 @@ class PixelClassificationPipeline:
             values = np.asarray(raw_data)
             if len(dims) != values.ndim:
                 raise ValueError(f"dims {dims} doesn't match array shape {values.shape}")
+
+        values, dims = _drop_singleton_extra_axes(values, dims)
 
         num_channels_in_data = values.shape[dims.index("c")] if "c" in dims else 1
         spatial_dims_in_data = [d for d in dims if d in "xyz"]
@@ -645,8 +874,21 @@ class PixelClassificationPipeline:
         spatial_shape = features.shape[:-1]
         n_features = features.shape[-1]
 
+        # Without this the forest would happily index whatever columns exist and
+        # return confident, plausible-looking, wrong probabilities.
+        expected_features = self._project.forest.feature_count
+        if n_features != expected_features:
+            raise ValueError(
+                f"Computed {n_features} feature columns but the trained forest expects "
+                f"{expected_features}. The feature selection in the project file doesn't match "
+                "what this input produces - check the channel count and whether the data is "
+                "2D or 3D (filtering a thin-z volume slice by slice yields 2 eigenvalue "
+                "channels per feature instead of 3)."
+            )
+
         flat = features.reshape(-1, n_features).astype(np.float32)
         flat_probs = self._project.forest.predict_probabilities(flat)
+        flat_probs = self._expand_to_label_space(flat_probs)
         n_classes = flat_probs.shape[-1]
         probs_zyxc = flat_probs.reshape(spatial_shape + (n_classes,))
 
@@ -665,24 +907,42 @@ class PixelClassificationPipeline:
 ###############################################################################
 
 
+def _read_tifffile(path: str) -> np.ndarray:
+    import tifffile
+
+    return tifffile.imread(path)
+
+
+def _read_imageio(path: str) -> np.ndarray:
+    import imageio.v3 as iio
+
+    return iio.imread(path)
+
+
 def _read_image(path: str) -> np.ndarray:
+    """
+    Try each backend in turn. A backend can fail two ways - it isn't installed
+    (ImportError), or it is installed but can't read this particular file (e.g.
+    tifffile raising TiffFileError on a PNG) - and both mean "try the next one".
+    Catching only ImportError would let a wrong-format error from an installed
+    tifffile escape before imageio, which reads the file fine, ever gets a turn.
+    """
     if path.endswith(".npy"):
         return np.load(path)
-    try:
-        import tifffile
 
-        return tifffile.imread(path)
-    except ImportError:
-        pass
-    try:
-        import imageio.v3 as iio
+    attempts = []
+    for name, reader in (("tifffile", _read_tifffile), ("imageio", _read_imageio)):
+        try:
+            return reader(path)
+        except ImportError:
+            attempts.append(f"{name}: not installed")
+        except Exception as e:
+            attempts.append(f"{name}: {type(e).__name__}: {e}")
 
-        return iio.imread(path)
-    except ImportError:
-        raise RuntimeError(
-            f"Don't know how to read {path!r}: install 'tifffile' or 'imageio' "
-            "(`pip install tifffile` or `pip install imageio`), or pass a .npy file."
-        )
+    raise RuntimeError(
+        f"Don't know how to read {path!r}. Tried:\n  " + "\n  ".join(attempts) + "\n"
+        "Install 'tifffile' or 'imageio' (`pip install tifffile imageio`), or pass a .npy file."
+    )
 
 
 def _save_output(probs: np.ndarray, path: str) -> None:

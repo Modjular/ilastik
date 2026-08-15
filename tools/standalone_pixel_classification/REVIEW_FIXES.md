@@ -1,7 +1,91 @@
-# Plan: fixing the code-review findings
+# Fixing the code-review findings
 
-Seven findings from a review of the `9e79f22..HEAD` diff. This is the
-execution plan: what changes, why, in what order, and how each is verified.
+Seven findings from a review of the `9e79f22..HEAD` diff: what changed, why,
+in what order, and how each was verified.
+
+## Status: all seven done
+
+Verification, in descending order of how much it proves:
+
+- **Old vs new on the real project is bit-identical.** Full 1024x1344 image,
+  `notebooks/pixel_classification_api/pc.ilp`: `max abs diff 0`, zero argmax
+  mismatches. The end-to-end numbers in HANDOFF.md (2.86e-8 vs the real
+  pipeline, 12 differing pixels) therefore carry over exactly — nothing in
+  this batch moved a number on the path that fixture exercises, which is what
+  you want from a batch that is mostly guards and a reorganised loop.
+- **`dev_validation/test_standalone_no_conda.py`, 9/9.** New; needs only
+  numpy/scipy/h5py. Covers the branches that fixture can't reach, and runs
+  every check against *both* copies of the code.
+- **The version-stub fix was executed and checked:** `ilastik.__version__`
+  resolves to 1.4.1 from the in-memory stub, nothing is written to disk, and
+  `isVersionCompatible("1.4")` returns True where the old `0.0.0.dev0` stub
+  made it False.
+
+### Correction: finding 4's performance premise was wrong
+
+The review predicted redundant presmoothing was "multiplying the dominant
+convolution cost by up to ~6x." Measured, it is not the dominant cost. On the
+real project the fix does what it was meant to — 37 presmoothing passes drop
+to 7 — but that is worth **~0.5s of ~8.8s** of feature computation, about 2%
+of the ~29s end-to-end run. Presmoothing was only 0.21s of it to begin with.
+
+Where the time actually goes, full image:
+
+| stage | time |
+|---|---|
+| RF inference | 20.7s |
+| StructureTensorEigenvalues (6 calls) | 3.1s |
+| HessianOfGaussianEigenvalues (6 calls) | 2.3s |
+| all four other filters (25 calls) | 0.7s |
+| presmoothing (7 calls, was 37) | 0.2s |
+
+So the standing advice in HANDOFF.md's open item #1 needs rethinking: the
+target is `np.linalg.eigvalsh` over ~1.4M small matrices and the tensor
+component smoothing around it, not the convolution scheduling. The change was
+kept — it removes genuinely redundant work and makes the two stages separable,
+which finding 7 needed anyway — but it is not the win it was sold as.
+
+### Note on finding 7 (thin-z), as requested
+
+**This one is reasoned from ilastik's source, not observed against it.** The
+logic is a faithful port of `OpBaseFilter.setupOutputs` and
+`OpPixelFeaturesPresmoothed.setupOutputs`, and the unit checks confirm this
+code does what those functions say. What is *not* confirmed is that the port
+matches real ilastik's output on a real thin-z project, because no 3D `.ilp`
+exists in this repo — the same gap HANDOFF.md's open item #3 already records.
+Treat it as unverified until someone runs a thin-z project through
+`compare_against_real_pipeline.py`.
+
+Two specifics worth knowing:
+
+- The asymmetry is deliberate and load-bearing. Feature filters honor
+  `invalid_z`; presmoothing honors only `ComputeIn2d`. On a thin-z volume with
+  `ComputeIn2d` unset, ilastik really does presmooth in 3D and then filter in
+  2D. It reads like an oversight in ilastik. Reproducing it is still correct,
+  because trained projects were computed with it — do not "fix" it.
+- One sub-case was deliberately **not** reproduced: `_n_per_space_axis` counts
+  only spatial axes with extent > 1, so ilastik claims 2 eigenvalue channels
+  for a 3D volume with a singleton y or x while its filter would still produce
+  3. That path looks internally inconsistent in ilastik itself, so guessing at
+  it would more likely introduce a divergence than remove one. A volume with a
+  singleton y or x will now trip the feature-count guard from finding 2 rather
+  than silently producing wrong output.
+
+### Also found, not fixed (out of scope, unreachable)
+
+`StructureTensorEigenvalues` at scale 0.3 produces all-NaN features: its
+gradient scale is `0.3 * 0.5 = 0.15`, so the order-1 kernel has
+`radius = round(2 * 0.15) == 0`, and its moment is zero, so `raw / moment` is
+0/0. Same for the other order-1 filters below scale ~0.35. This predates these
+fixes and **cannot occur in a real project**: `OpBaseFilter.minimum_scale` is
+0.7 and only `OpGaussianSmoothing` lowers it to 0.3
+(`lazyflow/operators/filterOperators.py`), so ilastik's GUI won't offer those
+combinations. Left alone; noted so nobody rediscovers it from a synthetic
+selection matrix and thinks it's a live bug.
+
+---
+
+## The plan as executed
 
 **Every fix lands twice.** `pixel_classification_standalone.py` is a hand-made
 concatenation of the six module files, with no build step. Each change below
@@ -118,10 +202,10 @@ stack that `np.concatenate` builds.
 reference and `dev_validation/validate_ilp_features_against_fastfilters.py`
 uses it); the pipeline just stops routing through it.
 
-Expected effect: this is the dominant term in the ~27s feature half of the
-~47s runtime, so it is the cheapest large win available — and it should be
-done before the `scipy.ndimage` rewrite floated as open item #1 in HANDOFF.md,
-since it may make that rewrite unnecessary.
+Expected effect when this was written: the cheapest large win available. That
+turned out to be wrong — see "Correction" above. Measured, it saves ~0.5s of
+~8.8s of feature computation. Kept anyway: the work really was redundant, and
+splitting the two stages is what finding 7 builds on.
 
 ## 5. Reject or drop a `t` axis instead of dying in `np.transpose`
 

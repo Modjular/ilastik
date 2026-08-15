@@ -51,6 +51,11 @@ class FeatureMatrix:
     scales: List[float]
     selections: np.ndarray  # bool, shape (len(feature_ids), len(scales))
     compute_in_2d: np.ndarray  # bool, shape (len(scales),)
+    # False when the project stored no ComputeIn2d dataset. ilastik fills an
+    # unset ComputeIn2d from the *input's* z extent at prediction time rather
+    # than from anything in the file (OpPixelFeaturesPresmoothed.setupOutputs),
+    # so the pipeline can only resolve it once it has the data in hand.
+    compute_in_2d_from_project: bool = True
 
 
 @dataclass
@@ -93,10 +98,11 @@ class PixelClassificationProject:
             feature_ids = _decode_str_list(fs["FeatureIds"])
             scales = list(fs["Scales"][()])
             selections = np.asarray(fs["SelectionMatrix"][()], dtype=bool)
-            if "ComputeIn2d" in fs:
+            compute_in_2d_from_project = "ComputeIn2d" in fs
+            if compute_in_2d_from_project:
                 compute_in_2d = np.asarray(fs["ComputeIn2d"][()], dtype=bool)
             else:
-                compute_in_2d = np.zeros(len(scales), dtype=bool)
+                compute_in_2d = np.zeros(len(scales), dtype=bool)  # placeholder; resolved against the input's z
 
             label_names = _decode_str_list(f["PixelClassification"]["LabelNames"])
 
@@ -106,7 +112,11 @@ class PixelClassificationProject:
             workflow_name=workflow_name,
             input_data=InputDataInfo(axis_order=axis_order, num_channels=num_channels),
             feature_matrix=FeatureMatrix(
-                feature_ids=feature_ids, scales=scales, selections=selections, compute_in_2d=compute_in_2d
+                feature_ids=feature_ids,
+                scales=scales,
+                selections=selections,
+                compute_in_2d=compute_in_2d,
+                compute_in_2d_from_project=compute_in_2d_from_project,
             ),
             label_names=label_names,
             forest=forest,

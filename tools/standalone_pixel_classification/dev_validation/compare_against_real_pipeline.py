@@ -33,6 +33,10 @@ import numpy as np
 TOOL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = os.path.dirname(os.path.dirname(TOOL_DIR))
 
+# Only used when the checkout has no generated ilastik/_version.py. See
+# _prepare_real_ilastik_imports() for why the value matters.
+STUB_ILASTIK_VERSION = "1.4.1"
+
 
 def _prepare_real_ilastik_imports():
     if "z5py" not in sys.modules:
@@ -40,10 +44,21 @@ def _prepare_real_ilastik_imports():
         stub.set_json_encoder = lambda *a, **kw: None
         sys.modules["z5py"] = stub
 
+    # ilastik/__init__.py does `from ._version import version`, which a
+    # pre-registered sys.modules entry satisfies - so we can supply the version
+    # without writing anything into the checkout. Writing a real
+    # ilastik/_version.py here would outlive this script: ilastik.__version__
+    # would become that stub value for everything else run from this checkout,
+    # and isVersionCompatible() (ilastik/__init__.py) compares only (major,
+    # minor), so a "0.0.0.dev0" stub makes every real 1.4.x project file look
+    # incompatible. Leave a genuine _version.py (from `pip install -e .`) alone.
     version_path = os.path.join(REPO_ROOT, "ilastik", "_version.py")
-    if not os.path.exists(version_path):
-        with open(version_path, "w") as f:
-            f.write('version = "0.0.0.dev0"\n')  # dev-only stub; ilastik/_version.py is gitignored
+    if not os.path.exists(version_path) and "ilastik._version" not in sys.modules:
+        stub = types.ModuleType("ilastik._version")
+        # Must be in the 1.4 series: isVersionCompatible() requires the running
+        # version and the project's version to both be in its compatible set.
+        stub.version = STUB_ILASTIK_VERSION
+        sys.modules["ilastik._version"] = stub
 
     if REPO_ROOT not in sys.path:
         sys.path.insert(0, REPO_ROOT)
