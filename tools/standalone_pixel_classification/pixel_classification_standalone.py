@@ -397,28 +397,63 @@ class _DecodedTree:
 
 
 class _DecodedForest:
-    """One 'Forest0000'-style sub-forest: a list of trees."""
+    """
+    One 'Forest0000'-style sub-forest: a list of trees.
 
-    def __init__(self, trees):
+    predict_probabilities() replicates vigra's RandomForest::predictProbabilities
+    (random_forest.hxx) exactly, including its dtype: vigra.learning.RandomForest.
+    predictProbabilities() is hard-typed to float32 output (its Boost.Python
+    signature only accepts NumpyArray<2, float, ...>), so the per-tree
+    accumulator is float32, not float64, while the internal totalWeight stays
+    double:
+
+        double totalWeight = 0.0;
+        for each tree:
+            cur_w = weights[l];                    // double (unweighted case)
+            prob(row, l) += static_cast<T>(cur_w);  // T=float32: truncated every tree
+            totalWeight += cur_w;                   // stays double
+        prob(row, l) /= static_cast<T>(totalWeight);
+
+    Only predict_weighted_==0 (ilastik's default) is implemented; raises for
+    predict_weighted_==1 rather than silently producing wrong output.
+    """
+
+    def __init__(self, trees, predict_weighted: bool = False):
         self.trees = trees
+        if predict_weighted:
+            raise NotImplementedError("predict_weighted_=1 forests are not supported")
 
     @classmethod
     def from_h5_group(cls, group: h5py.Group) -> "_DecodedForest":
         tree_names = sorted(k for k in group.keys() if k.startswith("Tree_"))
         trees = [_DecodedTree(group[name]["topology"][:], group[name]["parameters"][:]) for name in tree_names]
-        return cls(trees)
+        predict_weighted = False
+        if "_options" in group and "predict_weighted_" in group["_options"]:
+            predict_weighted = bool(group["_options"]["predict_weighted_"][()][0])
+        return cls(trees, predict_weighted=predict_weighted)
 
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
         class_count = self.trees[0].class_count
-        acc = np.zeros((n_rows, class_count), dtype=np.float64)
+        prob = np.zeros((n_rows, class_count), dtype=np.float32)
+        total_weight = np.zeros(n_rows, dtype=np.float64)
         for tree in self.trees:
-            acc += tree.predict_all(X)
-        return acc / len(self.trees)
+            cur_w = tree.predict_all(X)
+            prob += cur_w.astype(np.float32)
+            total_weight += cur_w.sum(axis=-1)
+        prob /= total_weight.astype(np.float32)[:, None]
+        return prob
 
 
 class DecodedParallelForest:
-    """The full 'ClassifierForests' group: several Forest000N sub-forests, averaged."""
+    """
+    The full 'ClassifierForests' group: several Forest000N sub-forests, averaged.
+
+    predict_probabilities() replicates ParallelVigraRfLazyflowClassifier.
+    predict_probabilities exactly, including its dtype: it operates directly
+    on the float32 arrays each sub-forest's predictProbabilities() returns, so
+    the whole cross-forest combination happens in float32, not float64.
+    """
 
     def __init__(self, forests):
         self.forests = forests
@@ -437,11 +472,12 @@ class DecodedParallelForest:
     def predict_probabilities(self, X: np.ndarray) -> np.ndarray:
         n_rows = X.shape[0]
         class_count = self.forests[0].trees[0].class_count
-        acc = np.zeros((n_rows, class_count), dtype=np.float64)
+        total = np.zeros((n_rows, class_count), dtype=np.float32)
         for forest in self.forests:
-            forest_probs = forest.predict_probabilities(X)
-            acc += forest_probs * len(forest.trees)
-        return acc / self.total_trees
+            forest_probs = forest.predict_probabilities(X) * np.float32(len(forest.trees))
+            total += forest_probs
+        total /= np.float32(self.total_trees)
+        return total
 
 
 ###############################################################################

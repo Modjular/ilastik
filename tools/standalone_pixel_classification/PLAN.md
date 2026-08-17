@@ -165,8 +165,10 @@ zero vigra dependency — and validated against real
 trained `.ilp` fixtures (`notebooks/pixel_classification_api/pc.ilp`,
 `tests/test_ilastik/data/inputdata/mitocheckPixelClassification.ilp` [40
 sub-forests], `tests/test_ilastik/data/inputdata/pc-oc-133.ilp` — 25 vs 49
-features, 4 vs 40 sub-forests). Max abs diff ~2.9e-8 across all three (float64
-accumulation-order noise, not a real discrepancy). See
+features, 4 vs 40 sub-forests). **Bit-identical (`0.0` diff) on all three** —
+the accumulation replicates vigra's exact float32-throughout arithmetic, not
+just its math (see "Precision follow-up" below for how this was found and
+closed; it wasn't bit-identical until that pass). See
 `dev_validation/validate_rf_reader_against_vigra.py` to reproduce (needs a
 vigra env — not needed to *use* `vigra_rf_reader.py` itself).
 
@@ -249,9 +251,15 @@ close to verbatim.
      validation, i.e. no real discrepancy at all.
    - **Binarized (argmax) predictions: 0 / 4096 pixels mismatched.**
 
+   (Numbers as of this pass. The RF accumulation was later made bit-identical
+   — see "Precision follow-up" below — and the harness itself was reworked
+   to run the full image by default and gate on argmax-flip-vs-real-margin
+   instead of raw diff; this snapshot is left as-is for the historical
+   record of what phase 5 originally proved.)
+
    This is now a reusable, standing test harness, not a one-off check:
    **`dev_validation/compare_against_real_pipeline.py`**, runnable as
-   `python compare_against_real_pipeline.py <project.ilp> <image> [--crop Y0 Y1 X0 X1] [--atol ...]`.
+   `python compare_against_real_pipeline.py <project.ilp> <image> [--crop Y0 Y1 X0 X1] [--margin-threshold 0.1]`.
    It self-contains the `z5py`/`ilastik._version` workarounds (see below) so
    it doesn't need any manual setup beyond having the reference conda env
    active.
@@ -318,11 +326,107 @@ defect introduced by this session's work, and not something the performance
 change caused (the RF walker was proven bit-identical before/after
 vectorizing, and this exact discrepancy was already latent in the original
 row-by-row implementation; the 64×64 crop just never happened to contain one
-of these rare boundary pixels). Not worth chasing further: closing it would
-mean bit-exact-replicating `fastfilters`' internal convolution summation
-order, which isn't really achievable (or meaningful) when comparing against
-a separate C++ implementation. Rate observed: 12 boundary-sensitive pixels
-out of 1,376,256 (0.00087%) on one real image.
+of these rare boundary pixels). Rate observed: 12 boundary-sensitive pixels
+out of 1,376,256 (0.00087%) on one real image. Follow-up below closed part of
+this gap and reframed how it's measured.
+
+### Precision follow-up: tested 3 concrete recommendations, 2 landed, 1 didn't (and why)
+
+A second opinion (a separate Claude Opus review of this plan) proposed three
+concrete, low-risk changes plus a reframed acceptance metric. Each was
+implemented and *measured* against real vigra/fastfilters/ilastik output
+rather than assumed to help - one of them didn't, and it's documented as a
+negative result rather than silently dropped:
+
+1. **"Float parity with fastfilters" isn't a fixed target in the first
+   place.** fastfilters does runtime CPU dispatch (AVX2+FMA / AVX / SSE) -
+   those paths don't produce identical floats, so even fastfilters doesn't
+   bit-match itself across machines, and vigra/fastfilters don't bit-match
+   each other either (ilastik uses whichever is installed). Bit-exactness
+   with "the reference" was never a coherent target. This reframes what
+   "done" means below.
+
+2. **Exact RF accumulation order and dtype - DONE, and it's a complete win.**
+   `vigra.learning.RandomForest.predictProbabilities()`'s Boost.Python
+   signature is hard-typed to float32 output (`NumpyArray<2, float, ...>`,
+   confirmed by triggering its `ArgumentError` with a float64 array) - so the
+   *entire* accumulation in real ilastik happens in float32, not float64:
+   vigra's `RandomForest::predictProbabilities` (random_forest.hxx)
+   truncates every single tree's contribution to `T=float32` before adding
+   it to the running per-pixel probability sum (only the internal
+   `totalWeight` normalizer stays `double`); and
+   `ParallelVigraRfLazyflowClassifier.predict_probabilities`
+   (lazyflow/classifiers/parallelVigraRfLazyflowClassifier.py) then combines
+   the sub-forests' already-float32 outputs with float32 arithmetic too.
+   `vigra_rf_reader.py` was accumulating in float64 throughout - "more
+   accurate" in isolation, but a mismatch from what real ilastik actually
+   computes. Rewrote both `DecodedForest.predict_probabilities` (per-forest)
+   and `DecodedParallelForest.predict_probabilities` (cross-forest) to
+   replicate the exact float32 accumulation. Result:
+   **`dev_validation/validate_rf_reader_against_vigra.py`'s diff against real
+   vigra went from `2.86e-8` to exactly `0.0` on all 3 fixtures** - not
+   "smaller," bit-identical. On the full 1024×1344 real-image end-to-end
+   test, this reduced the argmax-flip count from 12/1,376,256 to
+   **8/1,376,256**. (A `predict_weighted_` guard was added alongside this -
+   the real accumulation formula branches on that flag and every fixture
+   validated against uses `predict_weighted_=0`; the untested branch now
+   raises instead of silently producing wrong output for a project that sets
+   it.)
+
+3. **Kernel radius rounding convention - checked, confirmed not an issue.**
+   fastfilters computes its FIR kernel length as `floor(window_ratio*sigma +
+   0.5)` (`src/library/fir_kernel.c`) - i.e. round-half-up, not Python's
+   `round()` (round-half-to-even). These differ only exactly on a `.5` tie,
+   and none of ilastik's real `(window_size, sigma)` products (`2.0`/`3.5`
+   times any of `0.3, 0.7, 1.0, 1.6, 3.5, 5.0, 10.0` or their derived scales
+   like `sqrt(s²-1)`, `s*0.66`, `s*0.5`) land on an exact tie - already
+   implicitly confirmed by every prior filter validation matching to
+   `~1e-6/1e-7` (a kernel-length-off-by-one would show up as a large,
+   obvious error, not a small residual). No code change.
+
+4. **Closed-form eigenvalues to match fastfilters' `linalg.c` -
+   implemented, tested, and it does NOT help. Not adopted.** The hypothesis
+   (from the second opinion) was that `numpy.linalg.eigvalsh` (LAPACK
+   `?syevd`) amplifies near-degenerate-eigenvalue input noise differently
+   than fastfilters' closed-form analytic solver
+   (`src/library/linalg.c`: `_ev2d_default` for 2×2, an Eberly's-method
+   trigonometric solve for 3×3), and that matching the algorithm would
+   collapse the amplification gap. Transcribed fastfilters' exact C
+   formulas (same expression grouping, same `min(aDiv3,0)`/`min(q,0)`
+   clamps, same 3-element compare-swap sort network) into NumPy and tested
+   against real fastfilters on the same adversarial 3D near-degenerate case
+   characterized earlier: **the diff was identical to the last digit before
+   and after** (`5.429e-04` both times at scale 0.7, `1.160e-04` both times
+   at scale 1.6). Isolated why with a direct test: running *both*
+   `eigvalsh` and the closed-form solver on the exact same (already
+   computed) input matrix, they agree with **each other** to `1.5e-12` -
+   both are highly accurate algorithms for this problem. That proves the
+   `~1e-4` gap against fastfilters is driven entirely by the `~1e-6`
+   *input*-matrix difference (from upstream convolution rounding, already
+   characterized) passing through the eigenvalue problem's inherent
+   conditioning near degeneracy - not by which accurate algorithm solves
+   it. Swapping solvers can't fix sensitivity that lives in the math
+   problem itself, only in a genuine algorithm defect (there wasn't one).
+   Kept `numpy.linalg.eigvalsh` - it's simpler, already validated, and
+   produces the same numbers.
+
+5. **Reframed the acceptance metric, per the same feedback.** Raw
+   max-abs-diff on probabilities was always going to plateau somewhere
+   above zero for the reasons in point 1 - it doesn't distinguish "this
+   pixel was already a coin flip in the real pipeline" from "we confidently
+   disagree with a confident answer," which is the distinction that
+   actually matters. `dev_validation/compare_against_real_pipeline.py` now
+   gates pass/fail on: binarized (argmax) flip rate, and for every flipped
+   pixel, the *real* pipeline's own decision margin (top1 - top2
+   probability) there. A flip only fails the check if the real pipeline's
+   own margin exceeds `--margin-threshold` (default `0.1`) - i.e. it was
+   actually confident and got contradicted. Run against the full
+   1024×1344 real image (default now, no `--crop` needed - see the
+   performance section above): **8 flips, real-pipeline margin at every one
+   of them between 0.0 and 0.08 (several exactly `[0.5, 0.5]`), 0 confident
+   flips → `ALL OK`.** Raw probability diff stats are still printed
+   (`max abs diff: 9.0e-2` on that same run) but are informational only, not
+   part of the pass/fail decision anymore.
 
 ## Vigra dev environment (for validation work)
 
@@ -392,18 +496,35 @@ Notes:
 Every phase above is done and validated, end to end, against a real trained
 `.ilp` project and the real `ilastik.experimental.api.PixelClassificationPipeline`.
 The standalone deliverable is `pixel_classification_standalone.py`; the
-standing regression/proof harness is `dev_validation/compare_against_real_pipeline.py`.
+standing regression/proof harness is `dev_validation/compare_against_real_pipeline.py`,
+which now runs the **full** real test image by default (not just a crop) and
+gates pass/fail on argmax-flip-rate vs. the real pipeline's own decision
+margin, not raw probability diff (see "Precision follow-up" above for why).
+Current result on the full 1024×1344 real image: RF inference is
+bit-identical to real vigra; **8 argmax flips out of 1,376,256 pixels
+(0.0006%), all at pixels where the real pipeline's own confidence margin was
+already ≤0.08 → `ALL OK`.**
+
 Remaining open items, none of them blocking correctness:
 
-- **Feature-computation performance**: RF inference is now fast (~20s for
-  1.37M pixels); feature computation is the larger remaining share of the
-  ~47s full-image runtime. Not urgent (this is already a >10x improvement
-  and "practical for a real image" was the bar), but a candidate for a future
-  round if it needs to be faster still.
-- **3D eigenvalue-filter precision**: root-caused (see the feature-filters
-  section above) but not "fixed" in the sense of closing the gap further —
-  probably not worth chasing given it's inherent to comparing two independent
-  floating-point implementations near eigenvalue degeneracy, not a bug.
+- **Feature-computation performance**: RF inference is now both fast (~20s
+  for 1.37M pixels) and bit-identical to real vigra; feature computation is
+  the larger remaining share of the ~47s full-image runtime. Not urgent
+  (this is already a >10x improvement and "practical for a real image" was
+  the bar), but a candidate for a future round if it needs to be faster
+  still.
+- **The residual ~1e-6 feature-level noise against fastfilters** (and the
+  rare argmax flips it causes at already-ambiguous pixels) is understood in
+  detail (see "Precision follow-up" above) and not closeable without
+  vendoring fastfilters' actual C convolution code — deliberately not done,
+  since it would destroy the "pip install numpy scipy h5py, one file"
+  property that's the entire point of this. Current state (0.0006% flip
+  rate, 100% confined to pixels the real pipeline was already unsure about)
+  is treated as the acceptance bar, not a gap to keep closing.
+- **3D eigenvalue-filter precision**: same root cause as above, same
+  conclusion — not a bug, not chasing further (also tested and ruled out:
+  switching to fastfilters' own closed-form eigenvalue algorithm, see
+  "Precision follow-up" point 4).
 - **Autocontext / other workflows**: this only handles the Pixel
   Classification workflow (`_PixelClassificationProject.from_ilp_file` raises
   on anything else). `AutocontextPipeline` in the real API is out of scope

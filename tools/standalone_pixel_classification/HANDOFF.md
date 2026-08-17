@@ -31,13 +31,28 @@ image.tif -o probs.npy`).
 
 **Proof it's correct**, on `notebooks/pixel_classification_api/pc.ilp` +
 its bundled test image, full 1024×1344 image, diffed against the real
-pipeline:
-- Raw probabilities: max abs diff `2.86e-8` (float64 noise floor, not a
-  real discrepancy)
-- Binarized predictions: 12 / 1,376,256 pixels (0.00087%) differ — traced to
-  ground truth and explained (RF decision-boundary sensitivity amplifying
-  ordinary ~1e-6 cross-implementation feature noise; not a bug — see
-  PLAN.md's "Full-image validation" section for the full diagnostic)
+pipeline. Acceptance metric is deliberately NOT raw max-abs-diff (see
+PLAN.md's "Precision follow-up" section for why that's not a coherent
+target — fastfilters doesn't even bit-match itself across CPUs); it's
+argmax-flip-rate vs. the real pipeline's own decision-margin at each flip:
+- RF inference: **bit-identical** (`0.0` diff) to real
+  `vigra.learning.RandomForest.predictProbabilities()` — the accumulation
+  replicates vigra's exact float32-throughout arithmetic, not just its math.
+- End-to-end: **8 / 1,376,256 argmax flips (0.0006%)**, and every one of
+  them is at a pixel where the real pipeline's own top1-top2 confidence
+  margin was already ≤ 0.08 (several exactly `[0.5, 0.5]`) — i.e. genuinely
+  ambiguous pixels, not confident disagreements. `dev_validation/compare_against_real_pipeline.py`
+  reports `ALL OK` on this basis, run on the full image by default.
+- Root cause of the residual ~1e-6-level feature noise that drives those
+  rare flips is understood in detail (traced to a specific pixel, feature
+  vector diffed term-by-term, confirmed as ordinary cross-implementation
+  convolution rounding) and confirmed NOT closeable by algorithm changes —
+  a second-opinion suggestion to swap `numpy.linalg.eigvalsh` for
+  fastfilters' own closed-form eigenvalue solver was implemented and tested,
+  and made no difference at all (proven why: eigvalsh and the closed-form
+  solver agree with each other to `1.5e-12` on identical input — the gap is
+  from *input* differences hitting inherent eigenvalue-problem conditioning,
+  not algorithm choice).
 
 **Proof it's fast enough:** full image runs in ~47s end-to-end (was
 impractical to even finish before the RF-walker vectorization — see
@@ -98,23 +113,26 @@ build step stitching them together — the concatenation was done by hand).
 In rough priority order if you're picking a next task:
 
 1. **Feature-computation performance.** RF inference is fast now (~20s for
-   1.37M pixels); feature computation (the `nd_filters.py`/`ilp_features.py`
-   convolutions) is the larger remaining chunk of the ~47s full-image
-   runtime. Same kind of vectorization opportunity as the RF walker had, or
-   could lean harder on `scipy.ndimage`'s existing vectorization rather than
-   the current per-axis Python loop over `(feature, scale, channel)` triples.
+   1.37M pixels, and bit-identical to real vigra); feature computation (the
+   `nd_filters.py`/`ilp_features.py` convolutions) is the larger remaining
+   chunk of the ~47s full-image runtime. Same kind of vectorization
+   opportunity as the RF walker had, or could lean harder on
+   `scipy.ndimage`'s existing vectorization rather than the current per-axis
+   Python loop over `(feature, scale, channel)` triples.
 2. **Packaging.** Still just a file someone downloads. Could become a real
    pip package (`pip install ilastik-standalone-pc` or similar) if that's
    wanted — the file is already dependency-clean, so this is mostly
    `pyproject.toml` + CI, not more reverse-engineering.
 3. **3D validation depth.** 2D is thoroughly validated (real project, real
-   image, full-scale). 3D has only been validated on synthetic arrays
-   against `fastfilters` directly (not against a real trained 3D `.ilp`
-   end-to-end, since none was available in this repo/session). If a 3D test
-   project turns up, running it through `compare_against_real_pipeline.py`
-   would close that gap. Known residual: eigenvalue-based 3D filters have a
-   root-caused (not a bug, see PLAN.md) ~1e-4-level precision gap near
-   degenerate eigenvalues that doesn't show up in 2D.
+   image, full-scale, and passes the argmax-flip acceptance metric). 3D has
+   only been validated on synthetic arrays against `fastfilters` directly
+   (not against a real trained 3D `.ilp` end-to-end, since none was
+   available in this repo/session). If a 3D test project turns up, running
+   it through `compare_against_real_pipeline.py` would close that gap. Known
+   residual: eigenvalue-based 3D filters have a root-caused (not a bug, and
+   confirmed not fixable by an algorithm swap — see PLAN.md's "Precision
+   follow-up") ~1e-4-level precision gap near degenerate eigenvalues that
+   doesn't meaningfully show up in 2D.
 4. **Autocontext / other workflows.** Explicitly out of scope so far — only
    `workflowName == "Pixel Classification"` is supported;
    `ilp_project.py`/`ilp_project.py`'s embedded copy raises on anything
