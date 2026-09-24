@@ -571,7 +571,7 @@ Keep all the Python *wiring* built in phases 1–7, and replace only the two hot
 | Presmoothing / scale composition | `ilp_features.py` | unchanged (same logic, calls fastfilters) |
 | Feature filters | `kernel1d.py` + `nd_filters.py` (scipy) | **fastfilters' C library** via ctypes (`native_prototype/ff_ctypes.py`) |
 | Forest HDF5 decoding | `vigra_rf_reader.py` | unchanged; its arrays feed the C walker |
-| Tree traversal + accumulation | vectorised NumPy walk | **`native_prototype/rfwalk.c`** (~40 lines, OpenMP) via ctypes (`rf_native.py`) |
+| Tree traversal + accumulation | vectorised NumPy walk | **`native_prototype/rfwalk.c`** (~40 lines, plain C99) via ctypes (`rf_native.py`, Python threads over rows) |
 
 ### What to take from the binary, and what not to
 
@@ -600,41 +600,95 @@ Keep all the Python *wiring* built in phases 1–7, and replace only the two hot
   - `NativeForest` (rfwalk.c) differs by **exactly 0.0** from real `vigra.learning.RandomForest` on all 3 `.ilp` fixtures (20k random rows each).
 - `native_prototype/run_prototype.py` was run end to end from **plain system Python** (no vigra, no fastfilters Python package, no conda Python), pointing only at a `libfastfilters.so` file. Against real ilastik's output on the full test image it gives a **max abs diff of 6e-8 and 0 / 1,376,256 pixels with a different predicted class**.
 
-### What this means for tttk
+### Deployment in tttk
 
-`tttk` ships inside a Docker image that already contains the ilastik binary (passed to `tttk` as a path), and `tttk` has a `build.py` that compiles vendored C code (OpenCV). That removes most of the distribution problem:
+`tttk` currently ships inside a Docker image that already contains the ilastik binary (passed to `tttk` as a path). It also has a `build.py` that compiles vendored C code (OpenCV). In that image:
 
-- **No wheels, cibuildwheel or cross-platform matrix.** There is one target: the container's Linux x86_64.
-- **fastfilters, option A (zero build):** load the `libfastfilters.so` that ships inside the bundled ilastik release, located from the ilastik path `tttk` already gets.
-  - Pro: features come from the *same library build* as the ilastik the projects were trained with.
-  - Con: ties `tttk` to where that release puts the library.
-  - To verify: the exact path inside a release tarball, which isn't checked yet. The conda-built library needs nothing beyond glibc, so it should load from any Python.
-- **fastfilters, option B:** vendor fastfilters' source (MIT, small C library with CMake; CPU-specific code chosen at runtime, so one build runs on AVX2 and non-AVX2 hosts) and compile it in `build.py` like OpenCV.
-  - Pro: decouples `tttk` from the ilastik release's file layout.
-  - Con: a CMake build step to maintain.
-  - Recommendation: start with A and keep B as the fallback if the release layout proves unstable.
-- **rfwalk.c:** one `cc -O3 -fopenmp -shared -fPIC` line in `build.py` (`rf_native.build()` does exactly this).
+- **fastfilters:** load the library from the bundled ilastik release with `ff_ctypes.find_library(<ilastik root>)`. Features then come from the *same library build* as the ilastik the projects were trained with.
+- **rfwalk.c:** compile it in `build.py` (`rf_native.build()`), or use a prebuilt binary (see below).
 - **Python dependencies:** `numpy`, `h5py`, plus an image reader. `scipy` is only needed if the pure-Python fallback is kept.
 - **Worth measuring first:** how `tttk` calls ilastik today (headless subprocess?) and how long that takes per image *including startup*. The in-process path avoids ilastik's startup and lazyflow graph entirely, which may matter as much as the 1s of compute.
 
+### Cross-platform (Windows, macOS, Linux): requirement added 2026-09-24
+
+Targets: Linux x86_64, macOS x86_64 and arm64 (Apple Silicon), Windows x86_64. Only the two compiled pieces are platform-specific; everything else is plain Python.
+
+**Key property: no Python C-extension.** Both pieces are plain shared libraries loaded with `ctypes`, so they don't depend on the Python version or ABI. That means **one binary per platform**: 4 builds, not 4 × N Python versions. If they're ever packaged as wheels, the tag is `py3-none-<platform>`.
+
+#### fastfilters: already built for every target, no compiler needed
+
+ilastik-forge publishes fastfilters 0.3.post5 conda builds for `linux-64`, `osx-64`, `osx-arm64` and `win-64`. There is **no `linux-aarch64` build**. The osx-arm64, osx-64 and win-64 packages were downloaded and inspected with `lief` on 2026-09-24:
+
+| Platform | File in package | Exports all 13 C functions `ff_ctypes` needs | Depends on |
+|---|---|---|---|
+| linux-64 | `lib/libfastfilters.so.0.3-5-ge484a99` | yes (used for all validation) | glibc only |
+| osx-64 | `lib/libfastfilters.0.3-5-ge484a99.dylib` (5.1 MB) | yes | `libSystem` only |
+| osx-arm64 | `lib/libfastfilters.0.3-5-ge484a99.dylib` (2.6 MB) | yes; ad-hoc code-signed, min macOS 11 | `libSystem` only |
+| win-64 | `Library/bin/fastfilters.dll` (3.3 MB) | yes | `VCRUNTIME140` + UCRT only |
+
+The Python binding (`core.*.so/.pyd`) in each package is tied to Python 3.12, but the C library next to it isn't. It works from any Python through `ff_ctypes`, and `ff_ctypes.find_library()` knows all four layouts. There are three ways to get it:
+
+1. **From an ilastik install on that machine** (`find_library(<ilastik root>)`). This is the natural choice wherever ilastik is already installed.
+2. **Recommended: fetch it at build time from ilastik-forge.** `build.py` downloads the pinned `fastfilters-0.3.post5-<build>.conda` for the target platform (0.5–1 MB; pin URL + sha256), extracts the one library file and ships it inside `tttk`.
+   - No compiler.
+   - No dependency on ilastik being installed.
+   - Byte-for-byte the same binaries ilastik ships.
+   - fastfilters is MIT-licensed, so redistributing it is fine.
+   - A `.conda` file is a zip of zstd-compressed tars, so `zipfile` + `zstandard` + `tarfile` are enough.
+3. **Build from vendored source** (CMake; ARM is supported through its bundled SIMDe). Only needed for a platform ilastik-forge doesn't cover, e.g. Linux arm64 Docker images on Apple Silicon hosts. The alternative there is running the amd64 image under emulation.
+
+#### rfwalk.c: portable C99, cross-compiled from one Linux machine
+
+- **OpenMP dropped.** Apple clang doesn't support it, and MSVC only supports an old version. `rf_native.py` now splits rows across a Python `ThreadPoolExecutor` instead; `ctypes` releases the GIL during each call. Measured on 1.38M rows, 4 threads: **0.45s threaded vs 0.46s OpenMP, identical output**, and 1.72s single-threaded.
+- **Exports** use `__declspec(dllexport)` on Windows and default visibility elsewhere.
+- **Cross-compiles with `zig cc`** (`pip install ziglang`; zig 0.16.0) with no warnings under `-Wall -Wextra`, for `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, `aarch64-macos` and `x86_64-windows-gnu`. Each output exports `rf_predict` and depends only on the OS C runtime (glibc / libSystem / UCRT). The arm64 dylib is ad-hoc code-signed by the linker, which Apple Silicon requires. The binaries are 8–190 KB.
+  - Pin the minimum OS in the target triple: zig defaults to macOS 13, so use e.g. `aarch64-macos.11.0` to match fastfilters; for Linux, e.g. `x86_64-linux-gnu.2.17` for old glibc.
+- **Two ways to ship it:**
+  1. **Recommended: prebuild all 4 in one CI job** with `zig cc` and ship them in `tttk` next to the fastfilters libraries. Users never need a compiler, including on Windows.
+  2. **Compile in `build.py` on the target machine.** `rf_native.build(cc="python -m ziglang cc")` makes `ziglang` (a pip package) the only build dependency, with no system compiler or MSVC needed. `cc` also works where a system compiler exists.
+
+#### Platform gotchas to cover
+
+- **Windows:**
+  - `fastfilters.dll` needs `VCRUNTIME140.dll`. Every python.org and conda Python ships one next to `python.exe`, and loading by absolute path finds it there.
+  - If a library ever depends on a DLL in its *own* directory, call `os.add_dll_directory()` first (Python ≥ 3.8 no longer searches `PATH`).
+- **macOS:**
+  - Load by absolute path. The dylibs' install names (`@rpath/...`) don't matter then.
+  - Files that Python code downloads and extracts aren't quarantined by Gatekeeper, but files a user downloads through a browser are. Ship the libraries inside the package rather than asking users to fetch them.
+- **Linux:** conda-forge binaries target an old glibc, so they load on any current distro.
+- **Numerics across platforms:** fastfilters picks AVX/AVX2/FMA code at runtime on x86 and NEON through SIMDe on ARM, so feature values can differ in the last bits between machines. That's true of ilastik itself too. The acceptance metric (predicted-class flips only at pixels where ilastik itself was unsure) is designed for exactly this. rfwalk's output is deterministic given its inputs.
+
+#### Testing it everywhere
+
+A GitHub Actions matrix: `ubuntu-latest`, `macos-13` (x86_64), `macos-14` (arm64), `windows-latest`. Each job:
+
+1. **Fetch and build:** fetch the pinned fastfilters library and use the prebuilt (or freshly zig-built) rfwalk.
+2. **End-to-end check:** run `run_prototype.py` on `pc.ilp` against a stored reference.
+   - Use a cropped region, or store only argmax + margin, so the fixture stays small.
+   - Pass/fail on the argmax-flip metric.
+3. **Exactness check (optional):** a conda job per platform running `validate_native_prototype.py` against real vigra + fastfilters. conda-forge/ilastik-forge have both for all four targets.
+
 ### Remaining work
 
-1. **Find `libfastfilters.so` in the actual ilastik release** used in the `tttk` image. Run `run_prototype.py --libfastfilters <that path>` inside the container and compare with that ilastik's own output.
-2. **Turn the prototype into a module in `tttk`.** The harness currently monkeypatches `pixel_classification_standalone`'s `compute_feature_at_scale` global and forest object. The real version should call the native pieces directly, with a clean `from_ilp_file(path, ilastik_root=...)` / `get_probabilities(array)` API.
-3. **Add a `build.py` step** for `rfwalk.c` (and fastfilters' sources, if option B).
+1. **Run it on a real Mac and a real Windows machine.** Everything above was checked by inspecting binaries and cross-compiling, not by *running* on those platforms. The first job is the CI matrix above, or one manual run on each.
+2. **`build.py` steps:**
+   - fetch the pinned fastfilters `.conda` per platform (sha256-checked) and extract the library;
+   - prebuild rfwalk with `zig cc` (or build it on the target machine).
+3. **Turn the prototype into a module in `tttk`.** The harness currently monkeypatches `pixel_classification_standalone`'s `compute_feature_at_scale` global and forest object. The real version should call the native pieces directly, with a clean `from_ilp_file(path)` / `get_probabilities(array)` API that finds its bundled libraries itself.
 4. **Multi-channel input and 3D.**
    - `ff_ctypes` handles single-channel 2D/3D, which is all the per-channel feature loop passes.
    - 3D is validated per filter against fastfilters, but not yet end to end against a real trained 3D project.
-5. **Parallelise features (optional).** They run on one thread (~0.6s). A thread pool over feature/scale/channel jobs would work, because fastfilters' C calls hold no Python state. That isn't needed to match ilastik, but it's there if more speed is wanted.
+5. **Parallelise features (optional).** They run on one thread (~0.6s). The same thread-pool approach as rfwalk works, because ctypes releases the GIL during fastfilters calls. That isn't needed to match ilastik, but it's there if more speed is wanted.
 6. **Check the occasional slow first run** on a quieter machine before optimising for it.
 
 ### Files
 
 ```
 native_prototype/
-  ff_ctypes.py        ctypes binding to fastfilters' C API, mirroring its pybind glue
-  rfwalk.c            RF inference kernel (bit-exact with vigra)
-  rf_native.py        builds/loads rfwalk.c, packs decoded trees into flat arrays
+  ff_ctypes.py        ctypes binding to fastfilters' C API, mirroring its pybind glue; finds the
+                      library in ilastik/conda layouts on Linux, macOS and Windows
+  rfwalk.c            RF inference kernel (bit-exact with vigra), portable C99, no OpenMP
+  rf_native.py        builds/loads rfwalk.c, packs decoded trees into flat arrays, threads over rows
   run_prototype.py    end-to-end harness: timing + comparison with a reference .npy
 dev_validation/
   validate_native_prototype.py   ff_ctypes vs fastfilters, rfwalk vs vigra (both expect exact 0)

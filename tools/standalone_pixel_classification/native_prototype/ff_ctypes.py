@@ -22,14 +22,23 @@ doesn't:
 Only single-channel 2D (y, x) and 3D (z, y, x) float32 input is handled,
 which is all ilastik's per-channel feature loop ever passes.
 
-The library is located from, in order: the `path` argument to load(), the
-FASTFILTERS_LIB environment variable, then the platform's default library
-search path. In a tttk container, point it at the libfastfilters.so inside
-the bundled ilastik binary's lib/ directory.
+The library is located from, in order: the `path` argument to load() (a
+library file, or an ilastik install / conda env directory to search with
+find_library()), the FASTFILTERS_LIB environment variable, then the
+platform's default library search path.
+
+The same C API is exported by the ilastik-forge conda builds that ilastik
+releases bundle, on every platform (checked for fastfilters 0.3.post5):
+  linux-64            lib/libfastfilters.so.0.3-5-ge484a99
+  osx-64, osx-arm64   lib/libfastfilters.0.3-5-ge484a99.dylib
+  win-64              Library/bin/fastfilters.dll
+Each depends only on the OS C runtime (glibc / libSystem / VCRUNTIME140).
 """
 
 import ctypes
+import glob
 import os
+import sys
 
 import numpy as np
 
@@ -64,12 +73,32 @@ class _Options(ctypes.Structure):
     _fields_ = [("window_ratio", ctypes.c_float)]
 
 
+# Where the library sits inside an ilastik release / conda env, per platform.
+_SEARCH_PATTERNS = {
+    "win32": ["Library/bin/fastfilters.dll", "**/fastfilters.dll"],
+    "darwin": ["lib/libfastfilters*.dylib", "**/libfastfilters*.dylib"],
+}.get(sys.platform, ["lib/libfastfilters.so*", "**/libfastfilters.so*"])
+
+
+def find_library(root):
+    """Locate the fastfilters shared library under an ilastik install or conda env directory."""
+    for pattern in _SEARCH_PATTERNS:
+        hits = sorted(glob.glob(os.path.join(root, pattern), recursive=True))
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(f"no fastfilters shared library under {root!r} (looked for {_SEARCH_PATTERNS})")
+
+
 def load(path=None):
-    """Load libfastfilters.so and declare the C signatures used below."""
+    """Load the fastfilters shared library and declare the C signatures used below."""
     global _lib
     if _lib is not None:
         return _lib
-    path = path or os.environ.get("FASTFILTERS_LIB") or "libfastfilters.so"
+    path = path or os.environ.get("FASTFILTERS_LIB")
+    if path and os.path.isdir(path):
+        path = find_library(path)
+    if not path:
+        path = {"win32": "fastfilters.dll", "darwin": "libfastfilters.dylib"}.get(sys.platform, "libfastfilters.so")
     lib = ctypes.CDLL(path)
 
     A2, A3, O = ctypes.POINTER(_Array2D), ctypes.POINTER(_Array3D), ctypes.POINTER(_Options)

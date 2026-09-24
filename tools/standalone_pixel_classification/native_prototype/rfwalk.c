@@ -12,14 +12,25 @@
  * children, +4 feature column; parameters[addr + 1] = threshold (internal)
  * or first class weight (leaf).
  *
+ * Plain C99 with no dependencies and no OpenMP, so any compiler builds it
+ * (gcc, clang/Apple clang, MSVC, zig cc). Parallelism comes from the caller:
+ * rf_native.py splits rows across Python threads, and ctypes releases the
+ * GIL for the duration of each call.
+ *
  * Build without -ffast-math.
  */
 #include <stdint.h>
 
+#ifdef _WIN32
+#define RFWALK_EXPORT __declspec(dllexport)
+#else
+#define RFWALK_EXPORT __attribute__((visibility("default")))
+#endif
+
 #define LEAF_NODE_TAG 0x40000000
 #define MAX_CLASSES 64
 
-void rf_predict(int n_forests, const int32_t *trees_per_forest,
+RFWALK_EXPORT void rf_predict(int n_forests, const int32_t *trees_per_forest,
                 const int32_t *topo, const int64_t *topo_off,
                 const double *params, const int64_t *param_off,
                 const float *X, int64_t n_rows, int n_feat, int n_classes, float *out)
@@ -28,7 +39,6 @@ void rf_predict(int n_forests, const int32_t *trees_per_forest,
     for (int f = 0; f < n_forests; f++)
         total_trees += trees_per_forest[f];
 
-    #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < n_rows; r++) {
         const float *x = X + r * n_feat;
         float total[MAX_CLASSES] = {0};

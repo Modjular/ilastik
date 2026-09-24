@@ -20,7 +20,11 @@ branch to update it — don't open a new PR.
     - about 1.2–2s end to end, roughly on par with real ilastik;
     - max diff from real ilastik of 6e-8, with 0 pixels changing class;
     - both native pieces are bit-exact with their references (`dev_validation/validate_native_prototype.py`).
-- **Target deployment is the `tttk` Docker image**, which already contains the ilastik binary and a `build.py`. So "pip-only" is no longer a constraint, and cross-platform wheels aren't needed. Next steps are in `PLAN.md` → Direction 2 → "Remaining work".
+- **Target deployment is `tttk`**, which already has a `build.py` for vendored C code. So "pip-only" is no longer a constraint.
+- **It must run on Windows, macOS (Intel + Apple Silicon) and Linux.** The plan is in `PLAN.md` → Direction 2 → "Cross-platform". In short:
+  - ilastik-forge already publishes fastfilters builds for all four targets; they were checked to export the C API and to need only system libraries.
+  - `rfwalk.c` is now portable C99 with no OpenMP (rows are threaded from Python instead, at the same speed) and cross-compiles for all targets with `zig cc`.
+  - Nothing has been *run* on Windows or macOS yet. That's the first item in "Remaining work".
 - Try it (from repo root, needs only `numpy h5py imageio` and a C compiler):
 
   ```bash

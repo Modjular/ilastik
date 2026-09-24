@@ -8,18 +8,19 @@ scale composition, feature ordering, axis handling) and swaps only the two
 hot loops for compiled code:
 
   - feature filters -> fastfilters' C library via ctypes (ff_ctypes.py);
-    in tttk, the libfastfilters.so that ships inside the ilastik binary
+    in tttk, the fastfilters library that ships inside the ilastik binary
   - RF inference    -> rfwalk.c via ctypes (rf_native.py), compiled on first
     use (in tttk: by build.py)
 
 Needs only numpy + h5py + imageio in Python, a C compiler, and a
-libfastfilters.so. No vigra, lazyflow, pybind11 module or conda.
+fastfilters shared library (.so / .dylib / .dll). No vigra, lazyflow,
+pybind11 module or conda.
 
 Usage (from repo root):
     python tools/standalone_pixel_classification/native_prototype/run_prototype.py \\
         notebooks/pixel_classification_api/pc.ilp \\
         notebooks/pixel_classification_api/2d_cells_apoptotic_1channel.png \\
-        --libfastfilters /path/to/ilastik-release/lib/libfastfilters.so \\
+        --libfastfilters /path/to/ilastik-release \\
         [--reference real_probs.npy] [--repeat 3] [-o out.npy]
 """
 
@@ -79,7 +80,11 @@ def main():
     ap.add_argument("ilp_file")
     ap.add_argument("image_file")
     ap.add_argument("--dims", nargs="+", default=None, help="e.g. y x (default: y x for 2D, z y x for 3D)")
-    ap.add_argument("--libfastfilters", default=None, help="path to libfastfilters.so (else $FASTFILTERS_LIB)")
+    ap.add_argument(
+        "--libfastfilters",
+        default=None,
+        help="fastfilters library file, or an ilastik install / conda env dir to search (else $FASTFILTERS_LIB)",
+    )
     ap.add_argument("--reference", default=None, help=".npy of real ilastik probabilities to compare against")
     ap.add_argument("--repeat", type=int, default=2, help="timed runs (first includes warm-up)")
     ap.add_argument("-o", "--output", default=None)
