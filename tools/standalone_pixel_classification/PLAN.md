@@ -1,5 +1,14 @@
 # Standalone single-file Pixel Classification — rough draft plan
 
+> **Direction change, 2026-09-24.** Phases 1–7 below (the pure-Python,
+> pip-only, single-file direction) are done and correct, but **25–50× slower
+> than the ilastik binary**. That gap can't be closed without compiled code.
+> This work is superseded by **"Direction 2: native kernels + thin Python
+> harness"** at the end of this file, which keeps the Python wiring and swaps
+> only the two hot loops for compiled code. For why the first direction was
+> retired, see `POSTMORTEM_2026-09-24_pure_python_single_file.md`. Everything
+> below up to "Direction 2" is the original record, kept as is.
+
 ## Goal
 
 A single `.py` file (pip-installable deps only — no conda, no vigra, no fastfilters,
@@ -462,7 +471,7 @@ than just vigra/fastfilters:
 ```bash
 <prefix>/miniconda/bin/conda create -n vigra-env311 -c ilastik-forge -c conda-forge \
     python=3.11 vigra fastfilters h5py numpy
-<env>/bin/pip install xarray pydantic future psutil greenlet scikit-learn imageio
+<env>/bin/pip install xarray pydantic future psutil greenlet scikit-learn imageio platformdirs
 <prefix>/miniconda/bin/conda install -n vigra-env311 -c ilastik-forge -c conda-forge ndstructs
 ```
 
@@ -509,7 +518,10 @@ Remaining open items, none of them blocking correctness:
 
 - **Feature-computation performance**: RF inference is now both fast (~20s
   for 1.37M pixels) and bit-identical to real vigra; feature computation is
-  the larger remaining share of the ~47s full-image runtime. Not urgent
+  the larger remaining share of the ~47s full-image runtime. *(Corrected
+  2026-09-24: re-measured, this is backwards. Features take 14.6s and the RF
+  30.8s of a 45.5s run, and real ilastik does the whole image in about 1s.
+  See Direction 2.)* Not urgent
   (this is already a >10x improvement and "practical for a real image" was
   the bar), but a candidate for a future round if it needs to be faster
   still.
@@ -531,3 +543,99 @@ Remaining open items, none of them blocking correctness:
   unless wanted later.
 - **Packaging**: still just a single `.py` file someone downloads; not
   published as an installable package.
+
+---
+
+## Direction 2 (2026-09-24): native kernels + thin Python harness
+
+### Why
+
+The pure-Python direction was measured against real ilastik on 2026-09-24. Same container (4 vCPU), full 1024×1344 `pc.ilp` test image:
+
+| | Features | Random forest | Total |
+|---|---|---|---|
+| Pure-Python single file | 14.6s | 30.8s | 45.5s |
+| Real ilastik (`experimental.api`), default 4 threads | | | 0.9–1.75s |
+| Real ilastik, 1 thread | | | 3.1–4.1s |
+| **Direction 2 prototype** (`native_prototype/`) | **~0.6s** | **~0.4–1.0s** | **~1.2–2s** |
+
+Timings in this container vary by up to about 2× from run to run. The first run in a process is sometimes slower, but not consistently, so treat single numbers as rough. The full reasoning is in `POSTMORTEM_2026-09-24_pure_python_single_file.md`.
+
+### The idea
+
+Keep all the Python *wiring* built in phases 1–7, and replace only the two hot loops with compiled code:
+
+| Piece | Pure-Python version | Direction 2 |
+|---|---|---|
+| `.ilp` parsing, axes, feature ordering | `ilp_project.py` / `standalone_pipeline.py` | unchanged |
+| Presmoothing / scale composition | `ilp_features.py` | unchanged (same logic, calls fastfilters) |
+| Feature filters | `kernel1d.py` + `nd_filters.py` (scipy) | **fastfilters' C library** via ctypes (`native_prototype/ff_ctypes.py`) |
+| Forest HDF5 decoding | `vigra_rf_reader.py` | unchanged; its arrays feed the C walker |
+| Tree traversal + accumulation | vectorised NumPy walk | **`native_prototype/rfwalk.c`** (~40 lines, OpenMP) via ctypes (`rf_native.py`) |
+
+### What to take from the binary, and what not to
+
+- **fastfilters: take it as-is.**
+  - `libfastfilters.so` is a single plain-C library (MIT). It depends only on the C runtime: no boost, no Python, no HDF5.
+  - Its public C API (`fastfilters.h`) covers everything ilastik uses: `fir_gaussian`, `fir_gradmag`, `fir_laplacian`, `fir_hog`, `fir_structure_tensor` and `linalg_ev2d/3d`.
+  - Using the same library ilastik uses makes feature values match ilastik exactly. The 1e-6 differences from the pure-Python version, and the 8 changed pixels they caused, disappear.
+  - One catch: ilastik doesn't call the C API directly. It goes through fastfilters' pybind11 layer (`src/python/core.cxx` + `__init__.py`), and that layer has behavior of its own. `ff_ctypes.py` reproduces it call for call:
+    - `structureTensorEigenvalues(img, inner, outer)` passes `(inner, outer)` into C parameters declared `(sigma_outer, sigma_inner)`. This is the swap bug documented in phase 3; ilastik's output depends on it.
+    - The 3D eigenvalue solver is called with arguments in the order `ev3d(zz, yz, xz, yy, xy, xx, ...)`, not the header's declared order.
+    - Eigenvalue outputs come back channel-first from C and are moved to channel-last.
+    - `fastfilters_init()` has to be called once before any filter call.
+- **vigra's random forest: don't take the binary.**
+  - vigra's compiled `learning` module links about 40 conda shared libraries (boost_python, boost_thread, HDF5, OpenEXR, libtiff, AWS SDK, …), which makes it unusable as a building block.
+  - Its RF is header-only C++ templates (`random_forest.hxx`), so there's no small compiled piece to lift anyway.
+  - Prediction over already-decoded trees is simple. `rfwalk.c` reimplements `RandomForest::predictProbabilities` for `predict_weighted_ == 0`, plus the `ParallelVigraRfLazyflowClassifier` sub-forest combine, down to rounding:
+    - each leaf weight is truncated to float32 before accumulating;
+    - `totalWeight` is accumulated in double, one class at a time in class order (as vigra does, not summed per tree first);
+    - it is cast to float32 before the divide;
+    - it is compiled without `-ffast-math`.
+
+### Validated so far (2026-09-24)
+
+- `dev_validation/validate_native_prototype.py` (reference conda env):
+  - `ff_ctypes` gives **bit-identical output** to the `fastfilters` Python package for all 5 filters, in 2D and 3D, at scales 0.3–3.5 and window sizes 2.0 and 3.5.
+  - `NativeForest` (rfwalk.c) differs by **exactly 0.0** from real `vigra.learning.RandomForest` on all 3 `.ilp` fixtures (20k random rows each).
+- `native_prototype/run_prototype.py` was run end to end from **plain system Python** (no vigra, no fastfilters Python package, no conda Python), pointing only at a `libfastfilters.so` file. Against real ilastik's output on the full test image it gives a **max abs diff of 6e-8 and 0 / 1,376,256 pixels with a different predicted class**.
+
+### What this means for tttk
+
+`tttk` ships inside a Docker image that already contains the ilastik binary (passed to `tttk` as a path), and `tttk` has a `build.py` that compiles vendored C code (OpenCV). That removes most of the distribution problem:
+
+- **No wheels, cibuildwheel or cross-platform matrix.** There is one target: the container's Linux x86_64.
+- **fastfilters, option A (zero build):** load the `libfastfilters.so` that ships inside the bundled ilastik release, located from the ilastik path `tttk` already gets.
+  - Pro: features come from the *same library build* as the ilastik the projects were trained with.
+  - Con: ties `tttk` to where that release puts the library.
+  - To verify: the exact path inside a release tarball, which isn't checked yet. The conda-built library needs nothing beyond glibc, so it should load from any Python.
+- **fastfilters, option B:** vendor fastfilters' source (MIT, small C library with CMake; CPU-specific code chosen at runtime, so one build runs on AVX2 and non-AVX2 hosts) and compile it in `build.py` like OpenCV.
+  - Pro: decouples `tttk` from the ilastik release's file layout.
+  - Con: a CMake build step to maintain.
+  - Recommendation: start with A and keep B as the fallback if the release layout proves unstable.
+- **rfwalk.c:** one `cc -O3 -fopenmp -shared -fPIC` line in `build.py` (`rf_native.build()` does exactly this).
+- **Python dependencies:** `numpy`, `h5py`, plus an image reader. `scipy` is only needed if the pure-Python fallback is kept.
+- **Worth measuring first:** how `tttk` calls ilastik today (headless subprocess?) and how long that takes per image *including startup*. The in-process path avoids ilastik's startup and lazyflow graph entirely, which may matter as much as the 1s of compute.
+
+### Remaining work
+
+1. **Find `libfastfilters.so` in the actual ilastik release** used in the `tttk` image. Run `run_prototype.py --libfastfilters <that path>` inside the container and compare with that ilastik's own output.
+2. **Turn the prototype into a module in `tttk`.** The harness currently monkeypatches `pixel_classification_standalone`'s `compute_feature_at_scale` global and forest object. The real version should call the native pieces directly, with a clean `from_ilp_file(path, ilastik_root=...)` / `get_probabilities(array)` API.
+3. **Add a `build.py` step** for `rfwalk.c` (and fastfilters' sources, if option B).
+4. **Multi-channel input and 3D.**
+   - `ff_ctypes` handles single-channel 2D/3D, which is all the per-channel feature loop passes.
+   - 3D is validated per filter against fastfilters, but not yet end to end against a real trained 3D project.
+5. **Parallelise features (optional).** They run on one thread (~0.6s). A thread pool over feature/scale/channel jobs would work, because fastfilters' C calls hold no Python state. That isn't needed to match ilastik, but it's there if more speed is wanted.
+6. **Check the occasional slow first run** on a quieter machine before optimising for it.
+
+### Files
+
+```
+native_prototype/
+  ff_ctypes.py        ctypes binding to fastfilters' C API, mirroring its pybind glue
+  rfwalk.c            RF inference kernel (bit-exact with vigra)
+  rf_native.py        builds/loads rfwalk.c, packs decoded trees into flat arrays
+  run_prototype.py    end-to-end harness: timing + comparison with a reference .npy
+dev_validation/
+  validate_native_prototype.py   ff_ctypes vs fastfilters, rfwalk vs vigra (both expect exact 0)
+```

@@ -7,6 +7,7 @@ RandomForest.predictProbabilities().
 Usage (from repo root, in a conda env with vigra):
     python tools/standalone_pixel_classification/dev_validation/validate_rf_reader_against_vigra.py
 """
+
 import os
 import shutil
 import sys
@@ -22,49 +23,50 @@ from vigra_rf_reader import DecodedParallelForest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
-def check(ilp_path, group="PixelClassification/ClassifierForests"):
-    print(f"\n=== {ilp_path} ===")
+def real_vigra_probabilities(ilp_path, group, X):
+    """Ground truth: real vigra RandomForest objects, combined exactly the way
+    lazyflow/classifiers/parallelVigraRfLazyflowClassifier.py does it."""
     tmpdir = tempfile.mkdtemp()
     try:
         cache_path = os.path.join(tmpdir, "cache.h5")
         with h5py.File(ilp_path, "r") as src, h5py.File(cache_path, "w") as dst:
             src.copy(src[group], dst, name="ClassifierForests")
-
         with h5py.File(cache_path, "r") as f:
             forest_names = sorted(k for k in f["ClassifierForests"].keys() if k.startswith("Forest"))
 
-        # Ground truth: real vigra RandomForest objects, combined exactly the
-        # way lazyflow/classifiers/parallelVigraRfLazyflowClassifier.py does it.
         real_forests = [vigra.learning.RandomForest(cache_path, f"ClassifierForests/{n}") for n in forest_names]
         tree_counts = [rf.treeCount() for rf in real_forests]
-        total_trees = sum(tree_counts)
-        n_features = real_forests[0].featureCount()
-        n_classes = real_forests[0].labelCount()
-        print(
-            f"sub-forests: {len(forest_names)}, total trees: {total_trees}, "
-            f"features: {n_features}, classes: {n_classes}"
-        )
-
-        rng = np.random.default_rng(42)
-        X = rng.standard_normal((300, n_features)).astype(np.float32)
-
         acc = None
         for rf, tc in zip(real_forests, tree_counts):
             p = rf.predictProbabilities(X) * tc
             acc = p if acc is None else acc + p
-        ground_truth = acc / total_trees
-
-        # Our pure-NumPy decoder, reading the same HDF5 arrays directly.
-        decoded = DecodedParallelForest.from_ilp(ilp_path, group)
-        ours = decoded.predict_probabilities(X)
-
-        diff = np.abs(ground_truth - ours)
-        print("max abs diff:", diff.max(), " mean abs diff:", diff.mean())
-        ok = np.allclose(ground_truth, ours, atol=1e-6)
-        print("MATCH" if ok else "MISMATCH!!!")
-        return ok
+        return acc / sum(tree_counts)
     finally:
         shutil.rmtree(tmpdir)
+
+
+def check(ilp_path, group="PixelClassification/ClassifierForests"):
+    print(f"\n=== {ilp_path} ===")
+    decoded = DecodedParallelForest.from_ilp(ilp_path, group)
+    first_tree = decoded.forests[0].trees[0]
+    n_features, n_classes = first_tree.feature_count, first_tree.class_count
+    print(
+        f"sub-forests: {len(decoded.forests)}, total trees: {decoded.total_trees}, "
+        f"features: {n_features}, classes: {n_classes}"
+    )
+
+    rng = np.random.default_rng(42)
+    X = rng.standard_normal((300, n_features)).astype(np.float32)
+    ground_truth = real_vigra_probabilities(ilp_path, group, X)
+
+    # Our pure-NumPy decoder, reading the same HDF5 arrays directly.
+    ours = decoded.predict_probabilities(X)
+
+    diff = np.abs(ground_truth - ours)
+    print("max abs diff:", diff.max(), " mean abs diff:", diff.mean())
+    ok = np.allclose(ground_truth, ours, atol=1e-6)
+    print("MATCH" if ok else "MISMATCH!!!")
+    return ok
 
 
 if __name__ == "__main__":

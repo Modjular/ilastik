@@ -704,12 +704,13 @@ class PixelClassificationPipeline:
 def _read_image(path: str) -> np.ndarray:
     if path.endswith(".npy"):
         return np.load(path)
-    try:
-        import tifffile
+    if path.lower().endswith((".tif", ".tiff")):
+        try:
+            import tifffile
 
-        return tifffile.imread(path)
-    except ImportError:
-        pass
+            return tifffile.imread(path)
+        except ImportError:
+            pass
     try:
         import imageio.v3 as iio
 
@@ -739,7 +740,9 @@ def main():
     )
     parser.add_argument("ilp_file", help="Path to the trained ilastik .ilp project file.")
     parser.add_argument("image_file", help="Path to the input image (.tif/.tiff/.png/... or .npy).")
-    parser.add_argument("-o", "--output", default=None, help="Output path (.npy or .h5). Defaults to <image>_Probabilities.npy")
+    parser.add_argument(
+        "-o", "--output", default=None, help="Output path (.npy or .h5). Defaults to <image>_Probabilities.npy"
+    )
     parser.add_argument(
         "--dims",
         nargs="+",

@@ -9,6 +9,31 @@ done, what works, exact commands, and where to start.
 `claude/pixel-classification-single-file-w6w64p`). Push more commits to that
 branch to update it — don't open a new PR.
 
+## Current state (2026-09-24): read this first
+
+- **The pure-Python single-file direction is retired.** It is correct but 25–50× slower than the ilastik binary (45.5s vs 0.9–1.75s on the full test image). See `POSTMORTEM_2026-09-24_pure_python_single_file.md`.
+- **The active direction is "native kernels + thin Python harness"** (`PLAN.md`, "Direction 2").
+  - The Python wiring stays.
+  - Features go through fastfilters' C library via ctypes (`native_prototype/ff_ctypes.py`).
+  - RF inference goes through a 40-line C walker (`native_prototype/rfwalk.c`).
+  - Prototype result:
+    - about 1.2–2s end to end, roughly on par with real ilastik;
+    - max diff from real ilastik of 6e-8, with 0 pixels changing class;
+    - both native pieces are bit-exact with their references (`dev_validation/validate_native_prototype.py`).
+- **Target deployment is the `tttk` Docker image**, which already contains the ilastik binary and a `build.py`. So "pip-only" is no longer a constraint, and cross-platform wheels aren't needed. Next steps are in `PLAN.md` → Direction 2 → "Remaining work".
+- Try it (from repo root, needs only `numpy h5py imageio` and a C compiler):
+
+  ```bash
+  python tools/standalone_pixel_classification/native_prototype/run_prototype.py \
+      notebooks/pixel_classification_api/pc.ilp \
+      notebooks/pixel_classification_api/2d_cells_apoptotic_1channel.png \
+      --libfastfilters /path/to/libfastfilters.so
+  ```
+
+- Reference env recipe fix: the full ilastik env also needs `pip install platformdirs` (now in `PLAN.md`).
+
+Everything below is the handoff from the pure-Python direction. It is kept for its reverse-engineering notes, file map and validation workflow, which all still apply. Its speed statements are superseded by the numbers above.
+
 ## What this is
 
 A pip-only (`numpy`, `scipy`, `h5py` — no vigra, no fastfilters, no
@@ -56,7 +81,9 @@ argmax-flip-rate vs. the real pipeline's own decision-margin at each flip:
 
 **Proof it's fast enough:** full image runs in ~47s end-to-end (was
 impractical to even finish before the RF-walker vectorization — see
-PLAN.md phase 7).
+PLAN.md phase 7). *(2026-09-24: not fast enough. Real ilastik takes
+about 1s, and the random forest, not the features, is the larger share of the
+47s. See the postmortem.)*
 
 ## File map
 
