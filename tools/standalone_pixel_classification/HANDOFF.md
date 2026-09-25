@@ -220,3 +220,69 @@ python tools/standalone_pixel_classification/native_prototype/run_prototype.py \
 - `PLAN.md` → "Direction 2" and "Cross-platform": full design reasoning and measurements. Phases 1–7 cover the reverse-engineering of vigra/fastfilters/the `.ilp` format.
 - `POSTMORTEM_2026-09-24_pure_python_single_file.md`: why the pure-Python version was retired.
 - `HANDOFF_2026-08-17_pure_python.md`: the previous handoff (validation workflow, file map of the pure-Python modules).
+
+---
+
+## The simple TODO list (ELI5)
+
+**The big idea in one breath:** ilastik is fast because two small parts of it are written in C. We borrow those two parts (one is a "picture filter" library called fastfilters, the other is our own tiny "decision tree" file, `rfwalk.c`). Python glues them together. Your job is to move that glue into tttk and make sure the two C parts show up on every computer tttk runs on.
+
+Do these in order. Each step says how you know it's done.
+
+### Part 1: Answers before code (no coding)
+
+- [ ] **1. Ask: where does tttk run?** Only inside Docker, or also directly on people's Windows/Mac computers?
+  - *Why:* Docker means you only care about Linux. "Directly" means you care about 4 kinds of computer.
+  - *Done when:* you know which of these you need: Linux, Intel Mac, Apple Silicon Mac, Windows (and maybe Linux on ARM).
+- [ ] **2. Time today's way.** Run one image through tttk's current ilastik call and write down how many seconds it takes, start to finish.
+  - *Why:* so you can prove the new way is faster. (Skipping this step is how the last attempt went wrong; see the postmortem.)
+  - *Done when:* you have one number, e.g. "12 seconds per image".
+- [ ] **3. Find ilastik's fastfilters version.** In the ilastik that tttk bundles, find the file named like `libfastfilters.so.0.3-5-ge484a99` (Mac: `.dylib`, Windows: `fastfilters.dll`).
+  - *Why:* we tested version 0.3.post5 (`0.3-5` in the file name). If yours matches, great. If not, tell whoever maintains this.
+  - *Done when:* you've written the version down.
+
+### Part 2: See it work on your machine (5 minutes)
+
+- [ ] **4. Run the prototype once.** Use the "Try the prototype first" command above, pointing `--libfastfilters` at your ilastik folder.
+  - *Done when:* it prints `run 0: total ...s` without an error.
+- [ ] **5. Check it gives the same answer as ilastik.** Make ilastik's own answer with the headless command in "Validating in tttk", then run the prototype again with `--reference <that .npy>`.
+  - *Done when:* it prints `argmax flips 0` (or a handful, only on pixels ilastik itself was unsure about).
+
+### Part 3: Put it into tttk
+
+- [ ] **6. Copy the files over.** Follow the "What to port into tttk" table. Short version:
+  - copy `ff_ctypes.py`, `rf_native.py` and `rfwalk.c` as they are;
+  - copy the `.ilp`-reading and pipeline code from `pixel_classification_standalone.py` sections 4 and 5;
+  - use `feature_at_scale()` from `run_prototype.py`;
+  - **don't** copy sections 1–2, the command-line part, or `import scipy`.
+  - *Done when:* tttk has something like `PixelClassifier.from_ilp("x.ilp").predict(image)` and nothing in it imports scipy or vigra.
+- [ ] **7. Delete the hacks.** The prototype swaps functions out at runtime ("monkeypatching"). In tttk, call `feature_at_scale` and `NativeForest` directly.
+  - *Done when:* no line in the tttk code assigns to `pcs.compute_feature_at_scale` or to `pipeline._project.forest`.
+- [ ] **8. Don't "fix" the weird bits.** Read the "Invariants" list above. Six things look wrong on purpose. Leave them alone.
+  - *Done when:* step 5's check still passes after your copy.
+
+### Part 4: Make the C parts appear on every computer
+
+- [ ] **9. Teach `build.py` to download fastfilters.** For each computer type you need (from step 1), download the file from the table in "build.py", check its sha256, unzip it, and keep just the one library file.
+  - *Done when:* after `build.py` runs, tttk contains the right library file for each platform.
+- [ ] **10. Teach `build.py` to build `rfwalk.c`.** Run `pip install ziglang`, then the five `zig cc` lines in the "build.py" section. They make all the platform versions from one Linux machine.
+  - *Done when:* you have `librfwalk.so`, `librfwalk.dylib` and `rfwalk.dll` in the right folders.
+- [ ] **11. Make tttk load its own copies.** Have the code find both library files next to itself and pass their paths in: `ff_ctypes.load(path)`, `NativeForest(..., lib_path=path)`.
+  - *Done when:* it works on a machine that has no ilastik installed at all.
+
+### Part 5: Prove it on every computer (the part nobody has done yet)
+
+- [ ] **12. Run it on a real Mac and a real Windows machine.** Nobody has yet. Easiest way: a GitHub Actions matrix (ubuntu, macos-13, macos-14, windows) that runs one small image.
+  - *Done when:* all four jobs are green.
+- [ ] **13. Add a small test to tttk.** Crop the test image, save ilastik's answer for it (just the winning class per pixel plus how sure it was; a few KB), and compare against it in the test (see "Validating in tttk").
+  - *Done when:* the test runs in CI on every platform and passes.
+- [ ] **14. Time it again.** Same image as step 2, the new way.
+  - *Done when:* you have a before/after number. Expect roughly 1–2 seconds of compute.
+
+### Part 6: Nice to have (skip if short on time)
+
+- [ ] **15.** Try a 3D project and a multi-channel project. Neither has been tested end to end.
+- [ ] **16.** If tttk processes many images at once, set `NativeForest(..., n_threads=1)` so programs don't fight over CPUs.
+- [ ] **17.** Decide what happens with unsupported projects (Autocontext, >64 classes, weighted forests): give a clear error, or fall back to calling ilastik the old way.
+
+**Stuck?** Search `PLAN.md` for the topic. Almost every "why is it like this?" is answered there.
